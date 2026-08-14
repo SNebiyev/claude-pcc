@@ -26,14 +26,14 @@ Claude "PCC" sözünü eşidəndə bu protokolu yükləyir:
 ### Plugin kimi (tövsiyə olunur)
 
 ```
-/plugin marketplace add <owner>/claude-pcc
+/plugin marketplace add SNebiyev/claude-pcc
 /plugin install pcc@claude-pcc
 ```
 
 ### Əl ilə (şəxsi)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/SNebiyev/claude-pcc.git
 mkdir -p ~/.claude/skills
 cp -r claude-pcc/skills/pcc ~/.claude/skills/
 ```

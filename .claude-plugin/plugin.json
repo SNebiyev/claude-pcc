@@ -5,8 +5,8 @@
   "author": {
     "name": "Samir Nabiyev"
   },
-  "homepage": "https://gitlab.com/REPLACE_ME/claude-pcc",
-  "repository": "https://gitlab.com/REPLACE_ME/claude-pcc",
+  "homepage": "https://github.com/SNebiyev/claude-pcc",
+  "repository": "https://github.com/SNebiyev/claude-pcc",
   "license": "MIT",
   "keywords": ["pcc", "pre-commit", "quality-gate", "ci", "testing", "code-review", "claude-code"]
 }
