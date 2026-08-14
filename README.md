@@ -39,11 +39,33 @@ cp -r claude-pcc/skills/pcc ~/.claude/skills/
 
 Commit `skills/pcc/` to your repo as `.claude/skills/pcc/`. No install step - everyone who clones gets it.
 
+## Usage
+
+Two ways to invoke it, and they do the same thing:
+
+```
+/pcc                    # explicit - the slash command
+```
+
+or just say it in a sentence, in any language:
+
+```
+run PCC
+get this commit-ready
+PCC et
+```
+
+The `description` frontmatter lists trigger phrases in English and Azerbaijani, so Claude loads the skill on either.
+
+Pass an argument to skip the default:
+
+```
+/pcc gate               # the fast per-commit tier, not the full sweep
+```
+
 ## First run
 
-The skill's first action is to look for `<repo>/.claude/pcc.md`. If it is missing, it works out your stack and writes the adapter - `examples/pcc.md` is the template.
-
-Then just say "run PCC".
+The skill's first action is to look for `<repo>/.claude/pcc.md`. If it is missing, it works out your stack and writes the adapter - `examples/pcc.md` is the template. Commit that file so nobody rediscovers the same commands a third time.
 
 ## Requirements
 
