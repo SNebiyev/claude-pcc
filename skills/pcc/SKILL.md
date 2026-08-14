@@ -1,6 +1,6 @@
 ---
 name: pcc
-description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
+description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, how to fan a large baseline out across parallel read-only subagents so the main context stays empty, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
 ---
 
 # PCC - Pre Commit Check
@@ -65,11 +65,29 @@ Only these things change:
 
 1. **Scope is the tree, not a diff** - `git ls-files` narrowed to the code directories.
 2. **The mechanical gates already are whole-tree** - compile, typecheck, lint and the test suites take no diff. Run them first, unchanged. What they find is real and belongs to nobody.
-3. **The review skills run in chunks**, one module or directory per call, each with the same "SCOPE IS THESE N FILES ONLY" instruction. Order the chunks by blast radius: auth, payments and data migrations before settings screens. Set a budget up front and stop when it runs out - a partial baseline that states its own coverage beats an abandoned one.
+3. **The review runs in chunks**, one module or directory per call, each with the same "SCOPE IS THESE N FILES ONLY" instruction. Order the chunks by blast radius: auth, payments and data migrations before settings screens. Set a budget up front and stop when it runs out - a partial baseline that states its own coverage beats an abandoned one. On anything bigger than a small repo, run those chunks as parallel subagents - see the next section, it is what keeps the run short and the main context empty.
 4. **Findings go to the debt list. They are NOT fixed in this run.** Fix-everything applies to a delta you just wrote, not to years of other people's decisions. Fix only what the mechanical gates catch (cheap, unambiguous) and anything actively broken.
 5. **It ends by setting the clean point** - `git tag -f pcc-clean HEAD`. From then on every sweep is a delta again.
 
 Report it as **BASELINE**, never GREEN: a baseline inventories the tree, it does not certify it. List which chunks were covered and which were not.
+
+## Baseline at scale: fan out, keep the main context clean
+
+A baseline reads the whole tree - which is exactly the work that must NOT happen in the main context. An orchestrator that reads the source itself fills up with code and runs out before it can write the inventory it was started for.
+
+**Split the tree, delegate each chunk to a subagent, keep only the findings.**
+
+1. **Scout inline first, cheaply.** The chunk list comes from the repo, not from a guess: the build config's modules, the top-level source directories, `CODEOWNERS`, or a directory histogram over `git ls-files`. A few hundred tokens, and it decides everything after it.
+2. **One chunk = one module or one coherent directory**, never an arbitrary file count. A chunk has to be judgeable on its own - a reviewer shown half a feature reports noise. Split a module that is too big by layer (api / domain / storage), not at random.
+3. **Run the chunks in parallel.** They are independent by construction; that is what makes a module boundary a module boundary.
+4. **Subagents are READ-ONLY in a baseline.** They report, they do not edit. Parallel writers on a codebase nobody in the room knows yet produce conflicts you then have to review as well.
+5. **Fix the return shape before fanning out.** Each subagent returns a bounded list - `file:line`, severity, a one-sentence claim, why it matters - and nothing else. No file dumps, no quoted source. Cap it (say 10 findings per chunk, worst first) so one noisy module cannot flood the inventory.
+6. **Verify before a finding enters the debt list.** A subagent's finding is a claim made without the rest of the repo in view. Check the high-severity ones - yourself, or with a second agent asked to REFUTE rather than confirm. An inventory full of plausible-but-wrong entries is worse than a short one.
+7. **Never truncate silently.** If the budget covered 12 of 20 modules, the report names the 8 it did not read. "Covered everything" is the one thing a partial baseline must never imply.
+
+**What stays in the main session, undelegated:** compile, typecheck, lint and the test suites. Each is a single whole-tree command whose verdict comes from an artifact - putting an agent between you and that artifact only adds a place for the evidence to get paraphrased.
+
+The same fan-out applies to a sweep whose delta has grown huge (a long-lived branch, months of work merged at once). The trigger is the size of the scope, not which tier you are in.
 
 ## Speed: NARROW inside the loop, WIDE once at the end
 

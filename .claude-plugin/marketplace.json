@@ -5,7 +5,7 @@
   },
   "metadata": {
     "description": "PCC (Pre Commit Check) protocol - a commit-gate skill for Claude Code",
-    "version": "1.2.0"
+    "version": "1.3.0"
   },
   "plugins": [
     {
