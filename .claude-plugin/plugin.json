@@ -1,12 +1,20 @@
 {
   "name": "pcc",
-  "description": "PCC (Pre Commit Check) - istənilən layihə üçün commit qapısı protokolu: iki tier, addım sırası, sürət qaydaları və sübut qaydaları",
-  "version": "1.0.0",
+  "description": "PCC (Pre Commit Check) - a commit-gate protocol for any project: two tiers, step order, speed rules and evidence rules",
+  "version": "1.1.0",
   "author": {
     "name": "Samir Nabiyev"
   },
   "homepage": "https://github.com/SNebiyev/claude-pcc",
   "repository": "https://github.com/SNebiyev/claude-pcc",
   "license": "MIT",
-  "keywords": ["pcc", "pre-commit", "quality-gate", "ci", "testing", "code-review", "claude-code"]
+  "keywords": [
+    "pcc",
+    "pre-commit",
+    "quality-gate",
+    "ci",
+    "testing",
+    "code-review",
+    "claude-code"
+  ]
 }

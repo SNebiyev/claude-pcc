@@ -1,123 +1,123 @@
 ---
 name: pcc
-description: PCC (Pre Commit Check) protokolu - istənilən layihədə commit qapısı. "PCC", "full PCC", "PCC et", "gate", "sweep", "commit üçün hazırla" deyiləndə YÜKLƏ. İki tier, addımların sırası, sürət qaydaları (dar dövrə/geniş son), sübut qaydaları (artefakt oxu, exit kodu yox), verdikt və hesabat. PCC HEÇ VAXT commit etmir. Layihəyə xas əmrlər `<repo>/.claude/pcc.md` adapterindən gəlir.
+description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "get this commit-ready", or in Azerbaijani "PCC et", "commit üçün hazırla". Covers the two tiers, the unbreakable step order, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
 ---
 
 # PCC - Pre Commit Check
 
-Bu skill **protokoldur, əmr siyahısı deyil**. Layihəyə xas əmrlər, vaxtlar və tələlər adapterdədir.
+This skill is the **protocol, not a command list**. Project-specific commands, timings and traps live in the adapter.
 
-## 0. Adapteri tap - ilk iş budur
+## 0. Find the adapter - this is the first thing you do
 
 ```bash
-cat .claude/pcc.md 2>/dev/null || echo "ADAPTER YOXDUR"
+cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 ```
 
-- **Adapter varsa** - əmrlər, tier tərkibi, sağlamlıq yoxlamaları və layihə tələləri oradadır. Bu fayl onların üstündəki qaydadır.
-- **Adapter yoxdursa** - stack-i özün müəyyənləşdir (`package.json`, `build.gradle*`, `pom.xml`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `Makefile`, CI konfiqi), aşağıdakı qapı ailələrini həmin stack-in əmrlərinə uyğunlaşdır, sonra **`.claude/pcc.md`-ni yaz** - üçüncü dəfə eyni əmrləri yenidən kəşf etmə.
+- **Adapter exists** - the commands, tier contents, health checks and project traps are there. This file is the rule that sits on top of them.
+- **No adapter** - work out the stack yourself (`package.json`, `build.gradle*`, `pom.xml`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `Makefile`, the CI config), map the gate families below onto that stack's commands, then **write `.claude/pcc.md`**. Do not rediscover the same commands a third time.
 
-## Sıfırıncı qayda
+## Rule zero
 
-🔴 **PCC commit ETMİR.** Yaşıl verdiktdən sonra dayan, hesabat ver, açıq göstərişi gözlə.
+🔴 **PCC does NOT commit.** After a green verdict, stop, report, and wait for an explicit instruction.
 
-## İki tier
+## The two tiers
 
-| Tier | Nə vaxt | Tərkib | Hədəf vaxt |
+| Tier | When | Contents | Target time |
 |---|---|---|---|
-| **gate** | Hər commit | kompilyasiya + tip + lint + sürətli unit testlər | saniyələr - 2 dəq |
-| **sweep** | Gün sonu / iş dəstəsi bağlananda | gate + servislərin həqiqətən qalxması + review skill-ləri + tam test dəsti + e2e + təmiz build | 15-40 dəq |
+| **gate** | Every commit | compile + typecheck + lint + fast unit tests | seconds to 2 min |
+| **sweep** | End of day, or when a batch of work closes | gate + services actually come up + review skills + full test suite + e2e + clean build | 15-40 min |
 
-🔴 **"PCC" tək başına deyiləndə DEFAULT = SWEEP.** `gate` yalnız o söz deyiləndə. Soruşma.
+🔴 **"PCC" on its own means SWEEP.** Only run `gate` when that word is said. Do not ask.
 
-🔴 **Sweep-in sahəsi son təmiz nöqtədən HEAD-ə qədər BÜTÜN commitlərdir**, son commit tək başına yox. Təmiz nöqtəni işarələməyin yolu bir lokal git tag-ıdır (məs. `pcc-clean`): sweep yaşıl olanda tag HEAD-ə sürüşür, növbəti sweep-in sahəsi `git diff pcc-clean...HEAD` olur. Adapter bunu avtomatlaşdıran əmri saxlayır. Tag yoxdursa `origin/main...HEAD` işlət və bunu hesabatda de.
+🔴 **A sweep covers every commit since the last clean point**, not the last commit alone. Mark the clean point with a local git tag (e.g. `pcc-clean`): when a sweep goes green the tag moves to HEAD, so the next sweep's scope is `git diff pcc-clean...HEAD`. The adapter holds the command that automates this. With no tag, use `origin/main...HEAD` and say so in the report.
 
-## Sweep-in sırası - pozulmaz
+## The order of a sweep - never rearranged
 
-1. **Sahəni oxu** - `git diff --name-only <təmiz-nöqtə>...HEAD`.
-2. **Build + rerun** - kompilyasiya/tip/lint, sonra servisləri HƏQİQƏTƏN qaldır və canlı sağlamlıq yoxlaması et. "Kompilyasiya olundu" ≠ "işləyir".
-3. **Düzəliş** - tapılanların hamısını **BİR dəstə** halında.
-4. **`/security-review`** - yalnız deltaya.
-5. **`/simplify`** - yalnız deltaya.
-6. **`/code-review`** - yalnız deltaya.
-7. **Testlər** - tam dəst + e2e.
-8. **Son təmiz build** - `clean` ilə, çünki inkremental build keşdən yaşıl yalan verə bilər.
+1. **Read the scope** - `git diff --name-only <clean-point>...HEAD`.
+2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs".
+3. **Fix** - everything found, in **one batch**.
+4. **`/security-review`** - on the delta only.
+5. **`/simplify`** - on the delta only.
+6. **`/code-review`** - on the delta only.
+7. **Tests** - full suite plus e2e.
+8. **Final clean build** - with `clean`, because an incremental build can go green off a cache.
 
-**Sıra niyə vacibdir:** kod əvvəl oturur, SONRA review skill-ləri, SONRA yekun build. Tərsi olsa hər düzəliş review-ları köhnəldir və dövrə sıfırdan başlayır.
+**Why the order matters:** the code settles first, review skills run second, the final build runs last. Reversed, every fix invalidates the reviews and the loop restarts from zero.
 
-Review skill-ləri git bazası istəyir - `origin/HEAD` təyin olunmayıbsa əvvəl `git remote set-head origin -a`.
+The review skills need a git base - if `origin/HEAD` is unset, run `git remote set-head origin -a` first.
 
-## Sürət: dövrənin içində DAR, sonda BİR dəfə GENİŞ
+## Speed: NARROW inside the loop, WIDE once at the end
 
-Ara iterasiyada tam suite qaçırmaq xərcdir və heç nə sübut etmir - onsuz da sonda tam qaçış var. Qapı qırılanda **səbəbkar faylı düzəlt və yalnız o faylı yenidən yoxla**.
+Running the full suite on an intermediate iteration is a cost that proves nothing - the full run happens at the end anyway. When a gate breaks, **fix the offending file and re-check only that file**.
 
-| Qapı | Ara iterasiya | Yalnız son pass |
+| Gate | Intermediate iteration | Final pass only |
 |---|---|---|
-| lint | tək fayl(lar) | tam ağac |
-| tip yoxlaması | çox vaxt per-file variantı YOXDUR - tam qaçış, inkremental keşə güvən | tam qaçış |
-| unit | tək test faylı | tam dəst (adətən onsuz da ucuzdur) |
-| backend/inteqrasiya | ad filtri (`--tests "*Foo*"` və oxşarı) | tam dəst |
-| e2e | TƏK spec → sonra qrup | tam suite - **ara dövrədə HEÇ VAXT** |
+| lint | single file(s) | whole tree |
+| typecheck | usually has no per-file mode - run it whole, lean on the incremental cache | whole run |
+| unit | single test file | full suite (usually cheap anyway) |
+| backend / integration | name filter (`--tests "*Foo*"` or equivalent) | full suite |
+| e2e | ONE spec → then its group | full suite - **never** in an intermediate loop |
 
-## Review skill-lərinə HƏR RAUNDDA yalnız o raundun deltasını ver
+## Give the review skills only the CURRENT round's delta
 
-Sweep çox raunda uzananda bütün sahəni təkrar-təkrar oxutma. Real ölçü: yeddi raundluq sweep-də hər raund eyni 550 KB diffi yenidən oxudu, raund başına ~800 min token və 20+ dəqiqə, tapılanların demək olar hamısı əvvəlki raundlarda artıq baxılmış hissələrdə idi.
+When a sweep runs long, do not make the skills re-read the whole scope every round. Measured: a seven-round sweep re-read the same 550 KB diff each time, ~800k tokens and 20+ minutes per round, and nearly everything found sat in parts already reviewed in earlier rounds.
 
-- Raund başlayanda `git diff --name-only` ilə həmin raundun toxunduğu faylları götür, skill arqumentində fayl-fayl sadala və yaz: **"SCOPE IS THESE N FILES ONLY - do NOT read the wider diff"**.
-- Əvvəlki raundlarda tətbiq olunmuş və ya qəsdən təxirə salınmış tapıntıları **"DO NOT re-report"** siyahısı kimi ötür.
-- Şərh/sənəd-only düzəliş üçün tam sıfırdan PCC çağırma.
+- At the start of a round, take the files that round touched with `git diff --name-only`, list them file by file in the skill argument, and write: **"SCOPE IS THESE N FILES ONLY - do NOT read the wider diff"**.
+- Pass findings already applied or deliberately deferred as a **"DO NOT re-report"** list.
+- For a comment/docs-only fix, do not restart a full PCC.
 
-## Kosmetik tapıntı dövrəni BAŞLATMIR
+## A cosmetic finding does NOT restart the loop
 
-Dövrənin təkrarlanma səbəbi adətən məzmun deyil, mexanikadır: bir şərh sətrini düzəltsən ağac dəyişir, əvvəlki addımların sübutu köhnəlir, hər şey təkrar qaçır.
+The loop usually repeats for mechanical reasons, not substantive ones: fix one comment line, the tree changes, the earlier steps' evidence goes stale, everything re-runs.
 
-Tapıntını tətbiq etməzdən əvvəl soruş: **davranışı dəyişirmi?**
+Before applying a finding, ask: **does it change behaviour?**
 
-- **Bəli** → düzəlt, amma hamısını BİR dəstə et.
-- **Xeyr** (yanlış şərh, istifadə olunmayan qaytarım, test helper-i) → borc siyahısına yaz və dövrəni BAĞLA.
+- **Yes** → fix it, but batch all of them together.
+- **No** (a wrong comment, an unused return value, a test helper) → write it to the debt list and CLOSE the loop.
 
-Bir raund elan et ki, orada tapılan heç nə tətbiq olunmur, hamısı borca yazılır. Yoxsa hər düzəliş yeni raund doğurur. Bu, "hər tapıntını düzəlt" qaydası ilə ziddiyyət deyil - borc yazılır, atılmır.
+Declare one round in which nothing found is applied and everything goes to debt. Otherwise every fix spawns another round. This does not contradict "fix everything found" - the debt is recorded, not dropped.
 
-## Fix-everything siyasəti
+## Fix-everything policy
 
-PCC-də tapılan hər şey düzəlir - toxunmadığın fayllardakı, köhnə commitlərdən qalan problemlər də. Həm error, həm warning. Lint son passda **tam ağac** üzərində qaçır, dəyişən fayllarda yox (`tail` kəsilməsi bir dəfə əlavə warning-ləri gizlətmişdi). Tək istisna yuxarıdakı kosmetik qaydadır.
+Everything PCC finds gets fixed - including problems in files you did not touch and issues left by older commits. Errors and warnings alike. The final pass runs lint over the **whole tree**, not just changed files (a `tail` truncation once hid extra warnings). The only exception is the cosmetic rule above.
 
-## Sübut qaydaları
+## Evidence rules
 
-🔴 **Exit kodu sübut deyil.** Ölçülmüş nümunələr: `gradlew build | tail` 63 uğursuz testlə exit 0 verdi, `gofmt -l` problem tapanda da exit 0 verir. **Artefaktı oxu** - JUnit/JSON/TAP hesabatı, lint-in JSON çıxışı, test nəticə qovluğu.
+🔴 **The exit code is not evidence.** Measured examples: `gradlew build | tail` returned exit 0 with 63 failing tests; `gofmt -l` exits 0 even when it finds problems. **Read the artifact** - the JUnit/JSON/TAP report, the linter's JSON output, the test-results directory.
 
-🔴 **Artefakt TƏZƏ olmalıdır.** Köhnə test-nəticə faylı "pass" kimi oxunur. Addımın başlanğıc vaxtını saxla, artefaktın `mtime`-ı ondan böyük olmalıdır. UP-TO-DATE build sistemi (Gradle, Bazel, `make`) testi ümumiyyətlə qaçırmadan yaşıl görünə bilər.
+🔴 **The artifact must be FRESH.** An old test-result file reads as a pass. Record the step's start time and require the artifact's `mtime` to be newer. An UP-TO-DATE build system (Gradle, Bazel, `make`) can look green while executing no tests at all.
 
-🔴 **Qapının görmədiyi dil qapısız dildir.** Yeni dil/servis əlavə edəndə əvvəlcə PCC-nin onu həqiqətən QIRMIZI verdiyini neqativ kontrolla sübut et: kompilyasiya xətası, uğursuz test, format pozuntusu - üçü də ayrıca.
+🔴 **A language the gate cannot see is a language with no gate.** When you add a language or service, first prove with a negative control that PCC actually goes RED for it: a compile error, a failing test, a formatting violation - each one separately.
 
-## Uzun addımı necə qaçırmalı
+## How to run a long step
 
-🔴 **Uzun qaçışı (tam test dəsti, e2e, təmiz build) harness taskının içində saxlama - reap olunur və bütün qaçış itir.** Prosesi ayır, gözləməni AYRICA apar:
+🔴 **Do not run a long step inside a harness-tracked task - it gets reaped and the whole run is lost.** Detach the process and wait separately:
 
 ```bash
-nohup <uzun əmr> > "$LOG" 2>&1 < /dev/null &
+nohup <long command> > "$LOG" 2>&1 < /dev/null &
 PID=$!
 disown
 for i in $(seq 1 120); do kill -0 "$PID" 2>/dev/null || break; sleep 15; done
-tail -40 "$LOG"        # qərarı ARTEFAKTDAN ver
+tail -40 "$LOG"        # decide from the ARTIFACT
 ```
 
-Üç qayda, hər biri ölçülmüş bir asılı qalmadan gəlir:
+Three rules, each from a measured hang:
 
-1. **Gözləmə şərti prosesin canlılığıdır, mətn sentineli deyil.** Sentinel **nə baş verdiyini** deyir, **nə vaxt dayanmağı** yox - proses çöksə heç bir söz çap olunmur və sentinel-şərtli döngə saatlarla asılı qalır.
-2. **Canlılığı `kill -0 $PID` ilə yoxla, `pgrep -f "<naxış>"` ilə YOX.** Döngənin öz əmr sətri həmin naxışı daşıyır, yəni `pgrep` özünü görür və şərt heç vaxt yalan olmur. (Ehtiyac olsa `pgrep -f "pcc[.]mjs"` kimi mötərizə fəndi işlədilir, amma PID sadədir və dəqiqdir.)
-3. **Deadline məcburidir.** `seq 1 N` sayğacı olmayan döngə heç vaxt öz-özünə bitmir.
+1. **The wait condition is process liveness, not a text sentinel.** The sentinel tells you *what happened*, not *when to stop* - if the process dies nothing is ever printed and a sentinel-driven loop hangs for hours.
+2. **Check liveness with `kill -0 $PID`, never `pgrep -f "<pattern>"`.** The loop's own command line contains that pattern, so `pgrep` matches itself and the condition is never false. (If you must use a pattern, the bracket trick `pgrep -f "pcc[.]mjs"` works - but a PID is simpler and exact.)
+3. **A deadline is mandatory.** A loop with no `seq 1 N` counter never ends on its own.
 
-macOS-da `setsid` və `timeout` yoxdur - yuxarıdakı sayğac və ya `curl -m N` işlət.
+macOS has neither `setsid` nor `timeout` - use the counter above, or `curl -m N`.
 
-## Verdikt qırmızı verəndə - əvvəl mühiti şübhələn
+## When the verdict is red, suspect the environment first
 
-Ardıcıllıq `troubleshooting.md`-dədir: paralel sessiya artefaktları üstələyir, test icraçısı sükutla ilişir, e2e yük altında flake verir, iddia yenidən oxumur. Layihəyə xas tələlər adapterdədir.
+The sequence is in `troubleshooting.md`. Project-specific traps are in the adapter.
 
-## Hesabat
+## The report
 
-1. **Verdikt** - GREEN / RED, artefaktdan gələn rəqəmlərlə.
-2. **Neçə raund oldu, hər raundda nə düzəldi** - fayl adları ilə.
-3. **Borca yazılanlar** - harada saxlanılırsa orada, nömrələri ilə.
-4. **Təsdiqlənməmiş və ya keçilmiş addım varsa AÇIQ de** - "GREEN" sözü tək başına onu gizlədir.
-5. **Nəyi restart etmək lazımdır** - tam əmrlərlə. Heç nə lazım deyilsə bunu açıq de.
-6. **Commit mesajı layihəsi** - amma commit ETMƏ.
+1. **Verdict** - GREEN / RED, with the numbers taken from the artifacts.
+2. **How many rounds, and what each one fixed** - with file names.
+3. **What went to debt** - wherever debt is tracked, with its identifiers.
+4. **Say plainly if any step was unverified or skipped** - the word "GREEN" alone hides that.
+5. **What needs restarting** - with full commands. If nothing does, say so explicitly.
+6. **A draft commit message** - but do NOT commit.

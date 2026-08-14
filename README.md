@@ -1,36 +1,33 @@
 # PCC - Pre Commit Check
 
-Claude Code üçün commit qapısı protokolu. Stack-dən asılı deyil: JS, Java, Go, Rust, Python - fərq etmir, çünki əmrlər skill-də deyil, repo-nun öz adapterindədir.
+A commit-gate protocol for Claude Code. Stack-agnostic: JS, Java, Go, Rust, Python - it does not matter, because the commands live in your repo's adapter, not in the skill.
 
-> **Dil:** skill məzmunu azərbaycancadır.
-> **Language:** the skill content is written in Azerbaijani.
+## What it does
 
-## Nə edir
+When Claude hears "PCC", it loads this protocol:
 
-Claude "PCC" sözünü eşidəndə bu protokolu yükləyir:
+- **Two tiers.** `gate` on every commit (seconds), `sweep` at the end of the day (minutes). "PCC" on its own means sweep.
+- **An order that is never rearranged.** Build → services actually come up → fix → review skills → tests → clean build. The code settles first and review runs second, otherwise every fix invalidates the reviews.
+- **The speed rule: narrow inside the loop, wide once at the end.** When a gate breaks, fix the offending file and re-check only that file. Running the full suite on an intermediate iteration is a cost that proves nothing.
+- **The review skills get only the current round's delta.** Measured: a seven-round sweep re-read the same 550 KB diff every round, ~800k tokens per round.
+- **A cosmetic finding does not restart the loop.** If it does not change behaviour, it goes to the debt list.
+- **Evidence rules.** The exit code is not evidence (measured: `gradlew build | tail` returned exit 0 with 63 failing tests). Read the artifact - and the artifact must be FRESH, because an UP-TO-DATE build system can look green while executing no tests at all.
+- **How to run a long step.** `nohup … & disown` plus a `kill -0 $PID` loop. A text sentinel tells you what happened, not when to stop.
 
-- **İki tier.** `gate` hər commitdə (saniyələr), `sweep` gün sonunda (dəqiqələr). "PCC" tək başına deyiləndə default = sweep.
-- **Pozulmaz sıra.** Build → servislər həqiqətən qalxır → düzəliş → review skill-ləri → testlər → təmiz build. Kod əvvəl oturur, review sonra, yoxsa hər düzəliş review-ları köhnəldir.
-- **Sürət qaydası: dövrənin içində DAR, sonda BİR dəfə GENİŞ.** Qapı qırılanda səbəbkar faylı düzəlt və yalnız onu yenidən yoxla. Ara iterasiyada tam suite qaçırmaq xərcdir və heç nə sübut etmir.
-- **Review skill-lərinə hər raundda yalnız o raundun deltası.** Ölçülmüş nümunə: yeddi raundluq sweep-də hər raund eyni 550 KB diffi yenidən oxudu, raund başına ~800 min token.
-- **Kosmetik tapıntı dövrəni yenidən başlatmır.** Davranışı dəyişməyən tapıntı borca yazılır.
-- **Sübut qaydaları.** Exit kodu sübut deyil (ölçülmüş: `gradlew build | tail` 63 uğursuz testlə exit 0 verdi). Artefaktı oxu - və artefakt TƏZƏ olmalıdır, çünki UP-TO-DATE build sistemi heç nə icra etmədən köhnə nəticəni "pass" kimi göstərir.
-- **Uzun addımı düzgün qaçır.** `nohup … & disown` + `kill -0 $PID` döngəsi. Mətn sentineli nə baş verdiyini deyir, nə vaxt dayanmağı yox.
+`troubleshooting.md` carries nine universal traps: the reaped long run, a parallel session overwriting artifacts, the silently hanging test runner, e2e load flake, a stale tree, and formatters that lie with exit 0.
 
-`troubleshooting.md` doqquz universal tələni saxlayır: reap olunmuş uzun qaçış, paralel sessiyanın artefaktı üstələməsi, sükutla ilişən test icraçısı, e2e yük-flake-i, STALE ağac, exit 0 ilə yalan danışan format alətləri.
+**PCC never commits.** After a green verdict it stops and waits for an instruction.
 
-**PCC heç vaxt commit etmir.** Yaşıl verdiktdən sonra dayanır və göstərişi gözləyir.
+## Install
 
-## Quraşdırma
-
-### Plugin kimi (tövsiyə olunur)
+### As a plugin (recommended)
 
 ```
 /plugin marketplace add SNebiyev/claude-pcc
 /plugin install pcc@claude-pcc
 ```
 
-### Əl ilə (şəxsi)
+### Manually (personal)
 
 ```bash
 git clone https://github.com/SNebiyev/claude-pcc.git
@@ -38,21 +35,27 @@ mkdir -p ~/.claude/skills
 cp -r claude-pcc/skills/pcc ~/.claude/skills/
 ```
 
-### Repo daxilində (komanda)
+### Inside a repo (team)
 
-`skills/pcc/` qovluğunu öz repo-nuzun `.claude/skills/pcc/` yoluna commit edin. İnstall addımı olmur, klonlayan hər kəs alır.
+Commit `skills/pcc/` to your repo as `.claude/skills/pcc/`. No install step - everyone who clones gets it.
 
-## İlk qaçış
+## First run
 
-Skill ilk işi olaraq `<repo>/.claude/pcc.md` adapterini axtarır. Yoxdursa stack-i özü müəyyənləşdirir və adapteri yazır - `examples/pcc.md` onun şablonudur.
+The skill's first action is to look for `<repo>/.claude/pcc.md`. If it is missing, it works out your stack and writes the adapter - `examples/pcc.md` is the template.
 
-Sonra sadəcə "PCC et" de.
+Then just say "run PCC".
 
-## Tələblər
+## Requirements
 
-- Claude Code (`/security-review`, `/simplify`, `/code-review` built-in skill-lərindən istifadə edir - başqa custom skill asılılığı YOXDUR)
-- git repo-su, `origin/HEAD` təyin olunmuş: `git remote set-head origin -a`
+- Claude Code. It uses the built-in `/security-review`, `/simplify` and `/code-review` skills - there are **no custom skill dependencies**.
+- A git repo with `origin/HEAD` set: `git remote set-head origin -a`
 
-## Lisenziya
+## Dil haqqında / About language
+
+Skill ingiliscədir, amma **azərbaycanca işləyir**. Sən "PCC et" yazırsan, Claude ingiliscə protokolu oxuyur, sənə azərbaycanca cavab verir - skill-in dili cavabın dilini təyin etmir, söhbətin dili təyin edir. Tetikleyici sözlər hər iki dildə yazılıb.
+
+The skill is written in English but works in any language: the conversation's language decides the reply, not the skill's. Trigger phrases are listed in both English and Azerbaijani.
+
+## License
 
 MIT

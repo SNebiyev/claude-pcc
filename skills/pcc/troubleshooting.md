@@ -1,65 +1,67 @@
-# PCC qırmızı verəndə - əvvəl bunları keç
+# When PCC goes red - rule these out first
 
-Universal tələlər. Layihəyə xas olanlar `<repo>/.claude/pcc.md`-dədir.
+Universal traps. Project-specific ones live in `<repo>/.claude/pcc.md`.
 
-## 1. Uzun addım "reap" olundu, kod qüsuru deyil
+The order is not arbitrary: the ones nearer the top happen more often.
 
-Uzun və səssiz qaçış (tam e2e, tam test dəsti) harness taskının içində öldürülür. Heartbeat çap etmək kifayət etmir - reaper task QRUPUNU tutur, səssizliyi yox. Tək işləyən forma `SKILL.md`-nin "Uzun addımı necə qaçırmalı" bölməsindədir: `nohup … & disown` + ayrıca canlılıq döngəsi.
+## 1. The long step was reaped - not a code defect
 
-İz: log yarımçıq kəsilib, prosess yoxdur, heç bir xəta yazılmayıb.
+A long, silent run (full e2e, full test suite) gets killed inside a harness-tracked task. Printing a heartbeat is not enough - the reaper takes the process GROUP, not the silence. The only form that works is in `SKILL.md`, "How to run a long step": `nohup … & disown` plus a separate liveness loop.
 
-## 2. Uydurma qırmızı: paralel sessiya artefaktları üstələyib
+Symptom: the log is cut off mid-run, the process is gone, and no error was written anywhere.
 
-Əksər PCC skriptləri artefaktlarını sabit yola yazır (`/tmp/<layihə>-pcc/` və oxşarı) - sessiya və ya işçi ağac üzrə ayrılmır. İki agent sessiyası eyni repoda işləyəndə ikincinin qaçışı birincinin log-larını sükutla üstələyir.
+## 2. Phantom red: a parallel session overwrote the artifacts
 
-İz: yekun cədvəl `fail=1` deyir, log faylını açanda uğursuz sətir ümumiyyətlə yoxdur - sübut mövcud deyil.
+Most PCC scripts write their artifacts to a fixed path (`/tmp/<project>-pcc/` or similar), not separated by session or working tree. When two agent sessions work in the same repo, the second run silently overwrites the first one's logs.
 
-**Yoxlama - iddiadan ƏVVƏL:**
+Symptom: the summary says `fail=1`, but the log file contains no failing line at all - the evidence does not exist.
+
+**Check this BEFORE making a claim:**
 ```bash
-stat -f '%Sm' <log-yolu>        # macOS
-stat -c '%y' <log-yolu>         # Linux
+stat -f '%Sm' <log-path>        # macOS
+stat -c '%y' <log-path>         # Linux
 ```
-Log sənin qaçışının başlanğıcından ƏVVƏLdirsə və ya SONRAdırsa (başqa qaçış yazıb), onu oxumaq mənasızdır. Qapını öz izolyasiya olunmuş fayluna yenidən qaç.
+If the log is older than your run started - or newer, because another run wrote it - reading it is meaningless. Re-run that gate into your own isolated file.
 
-⚠️ Paralel sessiya PCC qaçırarkən PCC skriptinin ÖZÜNƏ toxunma - onun qaçışını sındırarsan.
+⚠️ While another session is running PCC, do not touch the PCC script itself - you will break their run.
 
-## 3. Test icraçısı sükutla ilişir
+## 3. The test runner hangs silently
 
-Böyük test dəsti resurs təzyiqi altında ilişə bilər: build daemon-u BUSY göstərir, heç bir worker prosesi qalmır, log 20+ dəqiqə dəyişmir, CPU 0%.
+A large suite can hang under resource pressure: the build daemon reports BUSY, no worker processes remain, the log has not moved for 20+ minutes, CPU is at 0%.
 
-⚠️ `-q`/`--quiet` ilə birləşəndə İKİ QAT aldadıcıdır - **uğur da sükutludur**. "Log dəyişmir" nə ilişmə, nə uğur sübutudur.
+⚠️ Combined with `-q`/`--quiet` this is doubly deceptive - **success is silent too**. "The log stopped moving" is evidence of neither a hang nor a pass.
 
-**Yoxlama:** worker prosesləri canlıdırmı (`ps aux | grep <executor>`), test-nəticə artefaktlarının `mtime`-ı irəliləyirmi.
+**Check:** are the worker processes alive (`ps aux | grep <executor>`), and are the test-result artifacts' `mtime`s advancing?
 
-**İlişəndə:** daemon-u öldür, sonra kiçik hədəflənmiş dəst (ad filtri + `--max-workers=1`) demək olar həmişə dərhal bitir. Tam dəst paralel iş olmadan, tək başına daha etibarlıdır.
+**When it hangs:** kill the daemon, then a small targeted set (name filter + `--max-workers=1`) almost always finishes immediately. The full suite is far more reliable run alone, with no parallel work beside it.
 
-## 4. e2e uğursuzluğu: yük-flake, spec qüsuru, yoxsa reqressiya?
+## 4. An e2e failure: load flake, spec defect, or real regression?
 
-Tam suite paralel işləyəndə (çoxlu brauzer + backend + frontend + build daemon eyni yaddaşda) **əlaqəsiz** spec random timeout verir. `retry=0` olanda bu "flaky" yox, "failed" kimi görünür.
+When the full suite runs in parallel (many browsers + backend + frontend + build daemon in the same memory), an **unrelated** spec takes a random timeout. With `retry=0` this shows up as "failed", not "flaky".
 
-Ardıcıllıq:
-1. Uğursuz spec toxunduğun kodla əlaqəlidirmi? Yoxdursa → flake ehtimalı yüksəkdir.
-2. Standalone qaçır. Təkbaşına təmiz keçirsə → yük-flake.
-3. 🔴 **Dayanma:** iddianın hər cəhddə YENİDƏN OXUYUB-oxumadığına bax. Lokator əsaslı iddia (`toHaveAttribute`, `toHaveText`) DOM sorğusunu təkrarlayır, **səhifəni yenidən yükləmir** - yük altında bir pis render onu timeout boyu qırır. Bu, infra flake DEYİL, düzəldilməli spec qüsurudur. Repair həmişə eyni: re-query yox, **re-READ**.
+The sequence:
+1. Is the failing spec related to the code you touched? If not, flake is likely.
+2. Run it standalone. Clean on its own → load flake.
+3. 🔴 **Do not stop there.** Check whether the assertion RE-READS on every attempt. A locator-based assertion (`toHaveAttribute`, `toHaveText`) re-queries the DOM but **does not reload the page** - under load one bad render holds it wrong for the whole timeout. That is not infra flake, it is a spec defect to fix. The repair is always the same: not re-query, **re-READ**.
 
-Uğursuz specləri adbaad təkrar qaçırmaq dəqiqələrdir, tam suite onlarla dəqiqə - əvvəl ucuzunu et.
+Re-running the failed specs one by one takes minutes; the full suite takes tens of minutes - do the cheap one first.
 
-## 5. "Ağac dəyişdi / STALE" deyir
+## 5. It says "the tree changed / STALE"
 
-Əvvəl **kimin faylının** dəyişdiyinə bax (`git status` + fayl `mtime`-ları):
+Look at **whose file** changed first (`git status` plus file `mtime`s):
 
-- Fayllar SƏNİN düzəlişindirsə → build addımını təkrar qaç və bil ki, review-lar da köhnəldi.
-- Başqa bir sessiya və ya insan paralel işləyirsə fayllar ONUNKUDUR → sürətli `gate` cari ağacı örtür, tam sweep-i təkrar qaçırmağa ehtiyac yoxdur.
+- The files are your own edits → re-run the build step, and know that the reviews went stale with it.
+- Another session or a human is working in parallel, so the files are theirs → the fast `gate` covers the current tree; there is no need to re-run the whole sweep.
 
-Generasiya olunan artefaktlar (OpenAPI JSON, snapshot, lock fayl) barmaq izindən çıxarılmalıdır - onları PCC-nin öz addımı yenidən yazır, mənbə dəyişikliyi deyil. Amma **PCC-nin qaçırmadığı** generatorun çıxışını çıxarma - onda real əl redaktəsi görünməz qalır.
+Generated artifacts (an OpenAPI JSON, a snapshot, a lock file) must be excluded from the fingerprint - a PCC step regenerates them, so they are not source changes. But do not exclude the output of a generator **PCC never runs**: that would blind the check to a real hand-edit.
 
-## 6. Review skill-ləri git bazası tapmır
+## 6. The review skills cannot find a git base
 
-`/security-review`, `/simplify`, `/code-review` `origin/HEAD...` işlədir:
+`/security-review`, `/simplify` and `/code-review` work off `origin/HEAD...`:
 ```bash
 git remote set-head origin -a
 ```
 
-## 7. Format/lint alətləri exit 0 ilə yalan danışır
+## 7. Formatters and linters that lie with exit 0
 
-`gofmt -l`, bəzi `prettier --check` variantları və oxşarları problem tapanda da exit 0 verir - sadəcə fayl adlarını stdout-a yazır. Qapı **çıxışın boş olmasını** tələb etməlidir, exit kodunu yox. Eyni sinif: heç bir test tapmayan qaçış da exit 0-dır - "0 test icra olundu" uğursuzluq sayılmalıdır.
+`gofmt -l`, some `prettier --check` variants and their relatives exit 0 even when they find problems - they just print the filenames on stdout. The gate must require **empty output**, not a zero exit code. Same class: a run that matched no tests also exits 0 - "0 tests executed" must count as a failure.

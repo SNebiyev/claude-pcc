@@ -1,66 +1,66 @@
-# PCC adapteri - NÜMUNƏ
+# PCC adapter - TEMPLATE
 
-Bu faylı öz repo-nda `<repo>/.claude/pcc.md` kimi saxla. Skill ilk işi olaraq onu oxuyur.
+Keep this file in your own repo as `<repo>/.claude/pcc.md`. The skill reads it as its first action.
 
-Adapter YALNIZ bu repo-ya aid olanı saxlayır: əmrlər, ölçülmüş vaxtlar, sağlamlıq yoxlamaları, bu repo-nun tələləri. Protokolun özü skill-dədir, buraya köçürmə.
+The adapter holds ONLY what is specific to this repo: commands, measured timings, health checks, this repo's traps. The protocol itself lives in the skill - do not copy it here.
 
-Yoxdursa skill stack-i özü müəyyənləşdirir (`package.json`, `build.gradle*`, `pom.xml`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `Makefile`, CI konfiqi) və bu faylı yazır. Üçüncü dəfə eyni əmrləri yenidən kəşf etməmək üçün onu commit et.
+If the file is missing, the skill works out the stack itself (`package.json`, `build.gradle*`, `pom.xml`, `go.mod`, `Cargo.toml`, `pyproject.toml`, `Makefile`, the CI config) and writes this file. Commit it so nobody rediscovers the same commands a third time.
 
 ---
 
-## Əmrlər
+## Commands
 
 ```bash
-# gate - hər commit qarşısında, saniyələr
-<kompilyasiya əmri>          # məs. ./gradlew compileJava compileTestJava
-<tip yoxlaması>              # məs. npx tsc --noEmit
-<lint>                       # məs. npx eslint src --cache
-<sürətli unit testlər>       # məs. npx tsx --test "src/**/*.test.ts"
+# gate - before every commit, seconds
+<compile>                    # e.g. ./gradlew compileJava compileTestJava
+<typecheck>                  # e.g. npx tsc --noEmit
+<lint>                       # e.g. npx eslint src --cache
+<fast unit tests>            # e.g. npx tsx --test "src/**/*.test.ts"
 
-# sweep - gün sonu
-<servisləri qaldır>          # məs. ./scripts/dev-up.sh all
-<tam test dəsti>             # məs. ./gradlew test
-<e2e>                        # məs. npx playwright test
-<təmiz build>                # məs. ./gradlew clean build
+# sweep - end of day
+<bring services up>          # e.g. ./scripts/dev-up.sh all
+<full test suite>            # e.g. ./gradlew test
+<e2e>                        # e.g. npx playwright test
+<clean build>                # e.g. ./gradlew clean build
 ```
 
-## Təmiz nöqtə
+## The clean point
 
-Sweep-in sahəsi son təmiz nöqtədən HEAD-ə qədərdir. Lokal git tag ilə işarələ:
+A sweep covers everything from the last clean point to HEAD. Mark it with a local git tag:
 
 ```bash
-git diff pcc-clean...HEAD --name-only     # sahə
-git tag -f pcc-clean HEAD                 # sweep yaşıl olanda (push OLUNMUR)
+git diff pcc-clean...HEAD --name-only     # the scope
+git tag -f pcc-clean HEAD                 # when the sweep goes green (never pushed)
 ```
 
-Tag yoxdursa `origin/main...HEAD` işlət və bunu hesabatda de.
+With no tag, use `origin/main...HEAD` and say so in the report.
 
-## Sağlamlıq yoxlamaları
+## Health checks
 
-Sweep-in "servislər həqiqətən işləyir" addımı üçün. Hər biri 200 qaytarmalıdır:
+For the sweep's "the services actually run" step. Each must return 200:
 
-| Servis | URL | Qeyd |
+| Service | URL | Note |
 |---|---|---|
 | backend | `http://localhost:8080/actuator/health` | |
-| frontend | `http://localhost:3000/` | ⚠️ redirect verən yolu YOX, son yolu yoxla - `curl -f` 3xx-i uğur sayır |
+| frontend | `http://localhost:3000/` | ⚠️ check the FINAL path, not one that redirects - `curl -f` treats a 3xx as success |
 
-## Ölçülmüş vaxtlar
+## Measured timings
 
-Dar/geniş qərarını rəqəmlə ver, hissiyyatla yox. Ölç, sonra yaz:
+Decide narrow-vs-wide from numbers, not instinct. Measure first, then fill this in:
 
-| Qapı | Dar | Geniş |
+| Gate | Narrow | Wide |
 |---|---|---|
-| lint | tək fayl, ~2 san | tam ağac, ~40 san |
-| tip | per-file YOXDUR | ~40 san |
-| unit | tək fayl | tam dəst, ~6 san |
-| inteqrasiya | ad filtri, ~20 san | tam dəst, ~90 san |
-| e2e | tək spec | tam suite - ara dövrədə HEÇ VAXT |
+| lint | single file, ~2s | whole tree, ~40s |
+| typecheck | no per-file mode | ~40s |
+| unit | single file | full suite, ~6s |
+| integration | name filter, ~20s | full suite, ~90s |
+| e2e | one spec | full suite - **never** in an intermediate loop |
 
-## Bu repo-nun tələləri
+## This repo's traps
 
-Buraya YALNIZ təkrar dəyən, bu repo-ya xas olanları yaz. Universal tələlər skill-in `troubleshooting.md`-sindədir.
+Put ONLY recurring, repo-specific ones here. Universal traps live in the skill's `troubleshooting.md`.
 
-- **`<alət>` problem tapanda da exit 0 verir** - çıxışı oxu, exit koduna baxma.
-- **`<test dəsti>` təzyiq altında sükutla ilişir** - yoxlama: worker prosesləri + artefakt mtime.
-- **Tanınan yük-flake specləri:** `<siyahı>` - adı burdadırsa və toxunmadığın koddursa, standalone yoxla.
-- **Generasiya olunan fayllar:** `<siyahı>` - "ağac dəyişdi" yoxlamasından çıxarılmalıdır, çünki PCC-nin öz addımı onları yenidən yazır.
+- **`<tool>` exits 0 even when it finds problems** - read its output, not the exit code.
+- **`<test suite>` hangs silently under pressure** - check worker processes plus artifact `mtime`s.
+- **Known load-flake specs:** `<list>` - if the name is here and it is not code you touched, verify standalone.
+- **Generated files:** `<list>` - must be excluded from the "tree changed" fingerprint, because a PCC step regenerates them.
