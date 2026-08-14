@@ -6,7 +6,9 @@ A commit-gate protocol for Claude Code. Stack-agnostic: JS, Java, Go, Rust, Pyth
 
 When Claude hears "PCC", it loads this protocol:
 
-- **Two tiers.** `gate` on every commit (seconds), `sweep` at the end of the day (minutes). "PCC" on its own means sweep.
+- **Three tiers.** `gate` on every commit (seconds), `sweep` at the end of the day (minutes), `baseline` once on a codebase PCC has never seen. "PCC" on its own means sweep.
+- **It works on a repo that predates it.** A sweep is scoped to a diff, which gives a newcomer to a years-old codebase nothing. `baseline` scopes to the whole tree instead, runs the review skills module by module, writes what it finds to a debt list rather than trying to fix years of other people's decisions, and ends by setting the clean point every later sweep diffs against.
+- **A missing lane is named, not skipped.** No e2e, no test suite, nothing to start - none of it stalls the run, and none of it hides inside the word "GREEN". Absence has to be proven (a suite you failed to find looks identical to one that does not exist) and then recorded in the adapter, so it is decided once instead of rediscovered every run.
 - **An order that is never rearranged.** Build → services actually come up → fix → review skills → tests → clean build. The code settles first and review runs second, otherwise every fix invalidates the reviews.
 - **The speed rule: narrow inside the loop, wide once at the end.** When a gate breaks, fix the offending file and re-check only that file. Running the full suite on an intermediate iteration is a cost that proves nothing.
 - **The review skills get only the current round's delta.** Measured: a seven-round sweep re-read the same 550 KB diff every round, ~800k tokens per round.
@@ -61,11 +63,14 @@ Pass an argument to skip the default:
 
 ```
 /pcc gate               # the fast per-commit tier, not the full sweep
+/pcc baseline           # the one-time whole-tree pass on an existing codebase
 ```
 
 ## First run
 
 The skill's first action is to look for `<repo>/.claude/pcc.md`. If it is missing, it works out your stack and writes the adapter - `examples/pcc.md` is the template. Commit that file so nobody rediscovers the same commands a third time.
+
+**Joining a project that already has years of history?** Run `/pcc baseline` once before anything else. A sweep diffs against a clean point, and on day one you have none - so the review steps would look at your first small commit and tell you nothing about the codebase you just inherited. The baseline inverts that: the whole tree is the scope, the review skills go module by module (highest blast radius first - auth, payments, migrations), and the output is an inventory of what is actually there. It does not try to fix it. It ends by tagging `pcc-clean`, and from that point on every sweep is a normal delta.
 
 ## Requirements
 

@@ -24,6 +24,18 @@ If the file is missing, the skill works out the stack itself (`package.json`, `b
 <clean build>                # e.g. ./gradlew clean build
 ```
 
+## Lanes this repo does NOT have
+
+The point of writing absence down is that it stops being rediscovered - and stops being confused with "I could not find it". One line each, with the reason.
+
+| Lane | Status | Why |
+|---|---|---|
+| e2e | none | not written yet - the sweep says so in its verdict |
+| integration | none | not applicable, this repo is a library |
+| services | none | nothing to start; the sweep's live check is skipped |
+
+Delete the rows that do not apply. If a lane exists but you could not find its command, that is NOT absence - find it before writing it here.
+
 ## The clean point
 
 A sweep covers everything from the last clean point to HEAD. Mark it with a local git tag:
@@ -34,6 +46,12 @@ git tag -f pcc-clean HEAD                 # when the sweep goes green (never pus
 ```
 
 With no tag, use `origin/main...HEAD` and say so in the report.
+
+**On an existing codebase the tag is set by the `baseline` run, not by hand.** Until it exists, a sweep has no meaningful scope - run `PCC baseline` once first.
+
+```bash
+git ls-files -- src backend            # the baseline scope: the tree, not a diff
+```
 
 ## Health checks
 

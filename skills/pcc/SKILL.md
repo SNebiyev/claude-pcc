@@ -1,6 +1,6 @@
 ---
 name: pcc
-description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "get this commit-ready", or in Azerbaijani "PCC et", "commit üçün hazırla". Covers the two tiers, the unbreakable step order, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
+description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
 ---
 
 # PCC - Pre Commit Check
@@ -26,25 +26,50 @@ cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 |---|---|---|---|
 | **gate** | Every commit | compile + typecheck + lint + fast unit tests | seconds to 2 min |
 | **sweep** | End of day, or when a batch of work closes | gate + services actually come up + review skills + full test suite + e2e + clean build | 15-40 min |
+| **baseline** | ONCE, on a repo PCC has never covered | gate over the whole tree + review skills over the codebase in chunks. Output is a debt inventory, not a fix list | hours, once |
 
-🔴 **"PCC" on its own means SWEEP.** Only run `gate` when that word is said. Do not ask.
+🔴 **"PCC" on its own means SWEEP.** Only run `gate` when that word is said. Do not ask. `baseline` is never implicit - it runs only when asked for by name, or when there is no clean point yet and you say so first.
 
 🔴 **A sweep covers every commit since the last clean point**, not the last commit alone. Mark the clean point with a local git tag (e.g. `pcc-clean`): when a sweep goes green the tag moves to HEAD, so the next sweep's scope is `git diff pcc-clean...HEAD`. The adapter holds the command that automates this. With no tag, use `origin/main...HEAD` and say so in the report.
 
 ## The order of a sweep - never rearranged
 
 1. **Read the scope** - `git diff --name-only <clean-point>...HEAD`.
-2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs".
+2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs". A repo with nothing to start (a library, a CLI) skips the live check and says so.
 3. **Fix** - everything found, in **one batch**.
 4. **`/security-review`** - on the delta only.
 5. **`/simplify`** - on the delta only.
 6. **`/code-review`** - on the delta only.
-7. **Tests** - full suite plus e2e.
+7. **Tests** - every lane this repo has: full suite, integration, e2e. Name the ones it does not have.
 8. **Final clean build** - with `clean`, because an incremental build can go green off a cache.
 
 **Why the order matters:** the code settles first, review skills run second, the final build runs last. Reversed, every fix invalidates the reviews and the loop restarts from zero.
 
 The review skills need a git base - if `origin/HEAD` is unset, run `git remote set-head origin -a` first.
+
+## A lane the project does not have
+
+Not every repo has every lane. Plenty have no e2e, some have no tests at all. A missing lane is **named**, never silently skipped and never a reason to stall - a "GREEN" that quietly means "no tests ran" is the exact failure this protocol exists to prevent.
+
+- **Prove absence, do not assume it.** No `test` script in `package.json` is not proof. Check the CI config, the `Makefile`, a `tests/` or `spec/` directory, the language's own convention (`go test ./...`, `cargo test`, `pytest`). A suite you failed to find reads exactly like a suite that does not exist.
+- **Record it in the adapter** under "Lanes this repo does not have", one line each with the reason (not written yet / not applicable / lives in another repo). Absence becomes a decision made once instead of a discovery repeated every run.
+- **Never invent the command.** Do not scaffold a test runner, do not run a script that is not there, and do not read a runner's "no tests found" as red.
+- **The verdict carries it:** `GREEN (no e2e lane in this repo)`. The remaining steps run unchanged.
+- A repo with no automated tests at all still gets a real gate from compile + typecheck + lint. Say that plainly, and say what is therefore unverified - that sentence is usually the most useful output of the first run.
+
+## `baseline` - the first run on a codebase PCC has never seen
+
+A sweep is scoped to `pcc-clean...HEAD`. On a repo with years of history and no tag that scope is either everything (unusable in one pass) or almost nothing (a new teammate's first commit) - either way the review steps deliver nothing. Run a baseline once per repo, before the first sweep.
+
+Only these things change:
+
+1. **Scope is the tree, not a diff** - `git ls-files` narrowed to the code directories.
+2. **The mechanical gates already are whole-tree** - compile, typecheck, lint and the test suites take no diff. Run them first, unchanged. What they find is real and belongs to nobody.
+3. **The review skills run in chunks**, one module or directory per call, each with the same "SCOPE IS THESE N FILES ONLY" instruction. Order the chunks by blast radius: auth, payments and data migrations before settings screens. Set a budget up front and stop when it runs out - a partial baseline that states its own coverage beats an abandoned one.
+4. **Findings go to the debt list. They are NOT fixed in this run.** Fix-everything applies to a delta you just wrote, not to years of other people's decisions. Fix only what the mechanical gates catch (cheap, unambiguous) and anything actively broken.
+5. **It ends by setting the clean point** - `git tag -f pcc-clean HEAD`. From then on every sweep is a delta again.
+
+Report it as **BASELINE**, never GREEN: a baseline inventories the tree, it does not certify it. List which chunks were covered and which were not.
 
 ## Speed: NARROW inside the loop, WIDE once at the end
 
@@ -118,6 +143,6 @@ The sequence is in `troubleshooting.md`. Project-specific traps are in the adapt
 1. **Verdict** - GREEN / RED, with the numbers taken from the artifacts.
 2. **How many rounds, and what each one fixed** - with file names.
 3. **What went to debt** - wherever debt is tracked, with its identifiers.
-4. **Say plainly if any step was unverified or skipped** - the word "GREEN" alone hides that.
+4. **Say plainly if any step was unverified, skipped, or absent from this repo** - the word "GREEN" alone hides all three.
 5. **What needs restarting** - with full commands. If nothing does, say so explicitly.
 6. **A draft commit message** - but do NOT commit.
