@@ -1,0 +1,19 @@
+{
+  "name": "claude-pcc",
+  "owner": {
+    "name": "Samir Nabiyev"
+  },
+  "metadata": {
+    "description": "PCC (Pre Commit Check) protokolu - Claude Code üçün commit qapısı skill-i",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "pcc",
+      "source": "./",
+      "description": "Commit qapısı protokolu: gate/sweep iki tier, addımların pozulmaz sırası, dar-dövrə/geniş-son sürət qaydaları, artefakt-oxu sübut qaydaları və AMBER/GREEN/RED verdikt. Stack-dən asılı deyil - layihəyə xas əmrlər repo-nun öz adapterindən gəlir.",
+      "category": "workflow",
+      "tags": ["pcc", "pre-commit", "quality-gate", "testing", "code-review"]
+    }
+  ]
+}
