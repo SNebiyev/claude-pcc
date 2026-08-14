@@ -2,13 +2,20 @@
 
 A commit-gate protocol for Claude Code. Stack-agnostic: JS, Java, Go, Rust, Python - it does not matter, because the commands live in your repo's adapter, not in the skill.
 
+## The three tiers
+
+| Tier | When | Scope | Time |
+|---|---|---|---|
+| `gate` | before every commit | the tree, mechanically | seconds to 2 min |
+| `sweep` | end of day, or when a batch closes | `pcc-clean...HEAD` | 15-40 min |
+| [`baseline`](#baseline---onboarding-onto-a-codebase-that-predates-pcc) | **once**, on a repo PCC has never covered | the whole tree | hours, once |
+
+"PCC" on its own means **sweep**. `baseline` is never implicit - it runs only when asked for by name.
+
 ## What it does
 
 When Claude hears "PCC", it loads this protocol:
 
-- **Three tiers.** `gate` on every commit (seconds), `sweep` at the end of the day (minutes), `baseline` once on a codebase PCC has never seen. "PCC" on its own means sweep.
-- **It works on a repo that predates it.** A sweep is scoped to a diff, which gives a newcomer to a years-old codebase nothing. `baseline` scopes to the whole tree instead, runs the review skills module by module, writes what it finds to a debt list rather than trying to fix years of other people's decisions, and ends by setting the clean point every later sweep diffs against.
-- **The baseline fans out.** The tree is split by module and each chunk goes to a read-only subagent that returns a bounded finding list - `file:line`, severity, one sentence - so the source never enters the main context and the chunks run in parallel instead of end to end. The mechanical gates stay undelegated: their verdict comes from an artifact, and an agent in between is just somewhere the evidence can get paraphrased.
 - **A missing lane is named, not skipped.** No e2e, no test suite, nothing to start - none of it stalls the run, and none of it hides inside the word "GREEN". Absence has to be proven (a suite you failed to find looks identical to one that does not exist) and then recorded in the adapter, so it is decided once instead of rediscovered every run.
 - **An order that is never rearranged.** Build → services actually come up → fix → review skills → tests → clean build. The code settles first and review runs second, otherwise every fix invalidates the reviews.
 - **The speed rule: narrow inside the loop, wide once at the end.** When a gate breaks, fix the offending file and re-check only that file. Running the full suite on an intermediate iteration is a cost that proves nothing.
@@ -40,7 +47,20 @@ cp -r claude-pcc/skills/pcc ~/.claude/skills/
 
 ### Inside a repo (team)
 
-Commit `skills/pcc/` to your repo as `.claude/skills/pcc/`. No install step - everyone who clones gets it.
+Commit `skills/pcc/` to your repo as `.claude/skills/pcc/`. No install step - everyone who clones gets it, and `git pull` is the update mechanism.
+
+### Updating
+
+**A plugin install does not auto-update.** It is pinned to a version and a commit SHA in a versioned cache directory, `claude plugin list` shows no "update available" marker, and refreshing the marketplace catalogue does not touch what is installed. To move to a new version:
+
+```
+/plugin marketplace update claude-pcc
+/plugin update pcc
+```
+
+then restart Claude Code.
+
+For a team all working in one repo, the committed-skill route above is the better one: everyone is on the same version by construction, it travels with the repo's own `.claude/pcc.md` adapter, and nobody has to remember to update anything.
 
 ## Usage
 
@@ -71,7 +91,35 @@ Pass an argument to skip the default:
 
 The skill's first action is to look for `<repo>/.claude/pcc.md`. If it is missing, it works out your stack and writes the adapter - `examples/pcc.md` is the template. Commit that file so nobody rediscovers the same commands a third time.
 
-**Joining a project that already has years of history?** Run `/pcc baseline` once before anything else. A sweep diffs against a clean point, and on day one you have none - so the review steps would look at your first small commit and tell you nothing about the codebase you just inherited. The baseline inverts that: the whole tree is the scope, the review skills go module by module (highest blast radius first - auth, payments, migrations), and the output is an inventory of what is actually there. It does not try to fix it. It ends by tagging `pcc-clean`, and from that point on every sweep is a normal delta.
+## Baseline - onboarding onto a codebase that predates PCC
+
+A sweep is scoped to `pcc-clean...HEAD`. That is the right scope for the person who just wrote the diff, and useless for someone joining a project with years of history: on day one there is no clean point, so the review steps either stare at the entire repo at once or at your first tiny commit. Either way you learn nothing about the code you just inherited.
+
+`baseline` inverts the scope, and runs once per repo.
+
+```
+/pcc baseline
+```
+
+**What it does differently:**
+
+| | sweep | baseline |
+|---|---|---|
+| Scope | `git diff pcc-clean...HEAD` | `git ls-files` - the tree |
+| Review | the delta, in the main session | module by module, **parallel read-only subagents** |
+| Findings | fixed in this run | written to a debt list, **not fixed** |
+| Verdict | GREEN / RED | **BASELINE** - it inventories the tree, it does not certify it |
+| Ends by | moving `pcc-clean` | creating `pcc-clean` for the first time |
+
+**Why it does not just fix what it finds.** Fix-everything applies to a delta you wrote ten minutes ago, not to years of other people's decisions. A newcomer whose first task becomes "clear the backlog" is blocked, not onboarded. So the baseline fixes only what the mechanical gates catch - compile, typecheck, lint, tests, all cheap and unambiguous - plus anything actively broken, and inventories the rest.
+
+**Why it fans out.** The tree is split by module (from the build config, the top-level source dirs, `CODEOWNERS`, or a directory histogram over `git ls-files`) and each chunk goes to its own read-only subagent. Each returns a bounded list - `file:line`, severity, one sentence, why it matters - capped per chunk so one noisy module cannot flood the inventory. The source never enters the main context, and the chunks run at once instead of end to end.
+
+Chunks are ordered by blast radius: auth, payments and data migrations before settings screens. Set a budget up front; if it covers 12 of 20 modules, the report **names the 8 it did not read**. A partial baseline that states its own coverage is useful. One that implies it covered everything is not.
+
+The mechanical gates stay in the main session on purpose - each is a single whole-tree command graded from an artifact, and an agent in between is only somewhere the evidence can get paraphrased.
+
+**After it:** every later sweep is a normal delta, and the codebase's debt is a list instead of a feeling.
 
 ## Requirements
 
