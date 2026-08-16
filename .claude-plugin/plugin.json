@@ -1,7 +1,7 @@
 {
   "name": "pcc",
   "description": "PCC (Pre Commit Check) - a commit-gate protocol for any project: three tiers, step order, speed rules and evidence rules, plus a whole-tree baseline that fans out across parallel subagents for codebases that predate it",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "author": {
     "name": "Samir Nabiyev"
   },

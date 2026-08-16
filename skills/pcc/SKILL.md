@@ -1,6 +1,6 @@
 ---
 name: pcc
-description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, how to fan a large baseline out across parallel read-only subagents so the main context stays empty, the speed rules (narrow in the loop, wide once at the end), the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
+description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, how to fan a large baseline out across parallel read-only subagents so the main context stays empty, the speed rules (narrow in the loop, wide once at the end), when an expensive step may be reused instead of re-run, the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
 ---
 
 # PCC - Pre Commit Check
@@ -119,6 +119,31 @@ Before applying a finding, ask: **does it change behaviour?**
 - **No** (a wrong comment, an unused return value, a test helper) → write it to the debt list and CLOSE the loop.
 
 Declare one round in which nothing found is applied and everything goes to debt. Otherwise every fix spawns another round. This does not contradict "fix everything found" - the debt is recorded, not dropped.
+
+## Reuse an expensive step only when its inputs are byte-identical
+
+The rule above is a judgement a human makes every round. Make it deterministic and it costs nothing to apply, every time, without being argued about.
+
+Give each expensive step a **declared set of inputs**, hash them, and store the hash beside the result. A step that PASSED and whose inputs are byte-identical carries its result forward instead of running again. Two axes, and both are needed:
+
+- **Path** - each step declares the paths it actually reads. Documentation, plan files, and the harness's own source are inputs to nothing. The backend suite does not read the frontend. The browser suite does not read the unit tests - but it DOES read the seed scripts that build the database it runs against, so a blanket "scripts are not app code" would skip the suite over a fixture change.
+- **Content** - inside those paths, hash comment-stripped source, so a rewritten comment is not a rewritten function.
+
+Rules that keep it honest, each one learned by getting it wrong first:
+
+1. **The hash is content identity, not history.** Do not hash HEAD. A commit moves no byte in the working tree, so hashing it makes the sweep straight after a commit pay full price - and it breaks stash round-trips and branch switches for the same reason.
+2. **Only the expensive steps may be reused.** Compile, lint and the fast unit suite re-run unconditionally, over the RAW tree. That is the counterweight that makes the comment axis safe: whatever the stripper looks past, those still see.
+3. **Never carry forward a result that was not a pass.** A flaky or failed step costs exactly what fixing it costs.
+4. **A carried-forward result must not read as "ran just now".** Print it with a different glyph, keep its ORIGINAL timestamp, and say which run it came from. This is the evidence rule below, in receipt form.
+5. **One flag forces everything** (`--rerun-all`), for when you distrust the mechanism.
+6. **Print the bill before it is paid.** A `status` command should name what the next run will REUSE and what it will RE-RUN - both lists, explicitly. Never let one be inferred from the other's absence: an inverted preview once announced a full re-run for a sweep that finished in 70 seconds, which is a worse answer than saying nothing.
+
+Measured on one repo: the sweep was ~25 minutes, 21 of them e2e. After this, a comment-or-docs edit costs **70 seconds** and the expensive lanes print as carried-forward.
+
+🔴 **Two traps found building it. Both silent, both in the dangerous direction (reuse something you should have run).**
+
+- **A failed command must THROW, never return empty.** `res.stdout ?? ""` over a failed `git` yields an empty file list, and an empty list hashes to a perfectly STABLE value. The first failure is harmless - it does not match the recorded hash, so everything runs. The SECOND consecutive failure matches the first exactly, and every expensive step is reused over a tree nobody read. Guard the success of the command, and guard the empty result separately: a command can exit 0 and still say nothing.
+- **`git ls-files` QUOTES non-ASCII paths** - `core.quotePath` defaults to true, so `src/lib/tələ.ts` arrives as `"src/lib/t\311\231l\311\231.ts"`. That string names no file, so it hashes as deleted and every future edit to that file is invisible to the gate covering it. Use `-z`. A repo with zero such paths today is exactly the repo where this ships unnoticed.
 
 ## Fix-everything policy
 

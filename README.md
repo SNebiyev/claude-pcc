@@ -21,6 +21,7 @@ When Claude hears "PCC", it loads this protocol:
 - **The speed rule: narrow inside the loop, wide once at the end.** When a gate breaks, fix the offending file and re-check only that file. Running the full suite on an intermediate iteration is a cost that proves nothing.
 - **The review skills get only the current round's delta.** Measured: a seven-round sweep re-read the same 550 KB diff every round, ~800k tokens per round.
 - **A cosmetic finding does not restart the loop.** If it does not change behaviour, it goes to the debt list.
+- **An expensive step is reused when its inputs are byte-identical.** Give each expensive step the paths it actually reads, hash them with comments stripped, and carry a PASSED result forward instead of running it again. Docs and plan files are inputs to nothing. Measured on one repo: the sweep was ~25 minutes, 21 of them e2e - a docs edit now costs 70 seconds. The cheap lane (compile, lint, unit) is never reused and always sees the raw tree, which is what makes the comment axis safe.
 - **Evidence rules.** The exit code is not evidence (measured: `gradlew build | tail` returned exit 0 with 63 failing tests). Read the artifact - and the artifact must be FRESH, because an UP-TO-DATE build system can look green while executing no tests at all.
 - **How to run a long step.** `nohup … & disown` plus a `kill -0 $PID` loop. A text sentinel tells you what happened, not when to stop.
 

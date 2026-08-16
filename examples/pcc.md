@@ -74,6 +74,23 @@ Decide narrow-vs-wide from numbers, not instinct. Measure first, then fill this 
 | integration | name filter, ~20s | full suite, ~90s |
 | e2e | one spec | full suite - **never** in an intermediate loop |
 
+## Reuse: what each expensive step actually reads
+
+Fill this in only if the runner supports per-step input hashing. Every expensive step names the
+paths it reads, and everything else is an input to nothing.
+
+| Step | Inputs | Notes |
+|---|---|---|
+| `<backend suite>` | `<backend/>` | migrations included - they decide what the tests run against |
+| `<e2e>` | `<app code, specs, static assets, API, seed scripts, root config>` | NOT the unit tests, NOT the PCC harness itself |
+| `<final clean build>` | same as the backend suite | same question, asked from a clean slate |
+
+Never listed as an input to anything: `*.md`, docs, plan files, the harness's own source.
+Never reusable at all: compile, lint, unit suite, formatters, audits.
+
+🔴 Also list here the files a PCC step REGENERATES (`<generated artifact list>`). They must be
+excluded from the hash, or every run is stale against a file the run itself rewrote.
+
 ## This repo's traps
 
 Put ONLY recurring, repo-specific ones here. Universal traps live in the skill's `troubleshooting.md`.
