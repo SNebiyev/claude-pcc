@@ -1,6 +1,6 @@
 ---
 name: pcc
-description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, how to fan a large baseline out across parallel read-only subagents so the main context stays empty, the speed rules (narrow in the loop, wide once at the end), when an expensive step may be reused instead of re-run, the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
+description: PCC (Pre Commit Check) protocol - a commit gate for any project. Load when asked for "PCC", "full PCC", "run PCC", "gate", "sweep", "baseline", "get this commit-ready", "check the whole codebase", or in Azerbaijani "PCC et", "commit üçün hazırla", "bütöv layihəni yoxla". Covers the three tiers (gate/sweep/baseline), the unbreakable step order, what to do when a lane like e2e does not exist, how to fan a large baseline out across parallel read-only subagents so the main context stays empty, the speed rules (narrow in the loop, wide once at the end - including the rule that a second verify after a red one is an ITERATION, not a final pass), why a delta-selector's baseline must be keyed to a commit and never to a clock, why the external dependencies of a long suite are probed before it runs, when an expensive step may be reused instead of re-run, the evidence rules (read the artifact, never the exit code), the verdict and the report. PCC NEVER commits. Project-specific commands come from the repo's own `<repo>/.claude/pcc.md` adapter.
 ---
 
 # PCC - Pre Commit Check
@@ -100,6 +100,59 @@ Running the full suite on an intermediate iteration is a cost that proves nothin
 | unit | single test file | full suite (usually cheap anyway) |
 | backend / integration | name filter (`--tests "*Foo*"` or equivalent) | full suite |
 | e2e | ONE spec → then its group | full suite - **never** in an intermediate loop |
+
+🔴 **A second `verify` after a red one IS an intermediate iteration.** This is the hole the table
+above does not close, and it is the single largest cost measured on a real sweep. The final pass is
+final only while it is passing; the moment it goes red and you fix something, the re-run is a loop
+iteration that happens to be spelled `verify` - and it pays the full price of every lane inside it.
+
+Measured, one sweep, 2026-09-05: **2 h 56 min total, 62 of them e2e across two full runs.** The
+review pass - the thing everyone suspects - was 21 minutes and ran six agents in parallel. The
+second full suite existed because a one-line locator fix and an edit to the orchestrator's own
+source invalidated the suite's input hash.
+
+So, after a red verdict:
+
+1. Fix everything the run found, in **one** batch. Never one fix, one re-run.
+2. Re-run **only the lanes that were red**, by name, narrow. A green lane does not become suspect
+   because a different lane failed.
+3. Re-run the whole thing **once**, at the end, when you believe it is finished - and only if a lane
+   that was green could plausibly have been broken by the fixes.
+
+If the harness cannot re-run one lane in isolation, that is a defect in the harness, not a reason to
+pay for all of them.
+
+## The delta-selector's baseline must be keyed to a COMMIT, never to a clock
+
+A suite that can select a subset from the delta needs a baseline: "what was the tree the last time
+this suite ran in full". Give that baseline a time-based expiry and it will be correct, useless, and
+silent - all at once.
+
+Measured: a 72-hour TTL against a cadence of one sweep every few days. Every single run printed
+`FULL suite: baseline is not trustworthy (124 hours)`, then `(125 hours)`. The selector was working
+exactly as designed - a stale baseline genuinely cannot answer - and it therefore **never fired
+once**, while the code that would have cut 21 minutes to 6 sat there passing its own tests.
+
+- Key the baseline to the **commit** it was taken at, so it stays valid until the tree moves.
+- If you must expire it, expire it on something that tracks the tree (a merge-base, a file count,
+  the number of commits since), never on hours elapsed.
+- ⚠️ The tell that you have this bug: the fallback branch fires on **every** run. A safety fallback
+  that is always taken is not a fallback, it is the implementation.
+
+## Probe the external dependencies BEFORE the long suite
+
+A browser suite needs more than the app: a tile server, an object store, a queue, a search index. Any
+of them can be down while the app itself answers 200 - and the suite will then report their absence
+as N application defects, after paying its full running time to do so.
+
+Measured twice on the same project: a map-tile container had exited days earlier. The suite spent
+**31 minutes** to report it as four failing map tests, each with a plausible-looking assertion error
+(`toBeVisible` on a tile image that had loaded its `src` but stayed at `opacity: 0`). A one-line
+`curl` answers the same question in 200 ms.
+
+Put the probe in the step that brings services up, next to the health checks that already run there,
+and name the dependency in the failure - "the tile server is down" is a different sentence from
+"four map tests failed", and only one of them sends you to the right place.
 
 ## Give the review skills only the CURRENT round's delta
 
