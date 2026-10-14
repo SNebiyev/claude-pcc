@@ -26,7 +26,7 @@ If the file is missing, the skill works out the stack itself (`package.json`, `b
 
 ## Low-risk paths
 
-One regex line of paths that cannot carry a security defect. The review skips the security lens (`security: false`) only when EVERY changed file matches; any other file, or no line, means the lens runs. Caller formula: `git diff --name-only <range> | grep -Evq '<regex>'` (exit 0 -> security=true). Do not list agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, .claude/) as low risk.
+One regex line of paths that cannot carry a security defect. The review skips the security lens (`security: false`) only when EVERY changed file matches; any other file, or no line, means the lens runs. Caller formula: `git diff --no-renames --name-only <range> | grep -Evq '<regex>'` (exit 0 -> security=true). Do not list agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, .claude/) as low risk.
 
 ```
 low_risk_paths: (\.md$|_test\.go$|\.(test|spec)\.(ts|tsx)$|^e2e/|\.css$|\.(png|jpe?g|webp|gif|ico)$)

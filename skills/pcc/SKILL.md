@@ -34,7 +34,7 @@ cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 
 ## The order of a sweep - never rearranged
 
-1. **Read the scope** - `git diff --name-only <clean-point>...HEAD`.
+1. **Read the scope** - `git diff --no-renames --name-only <clean-point>...HEAD`.
 2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs". A repo with nothing to start (a library, a CLI) skips the live check and says so.
 3. **Fix** - everything found, in **one batch**.
 4. **Review** - ONE review per batch: `Workflow({name: "pcc:pcc-review", args: {repo, range: "<base>..<head>", changedLines, security, tier, fix, lanes, context, limits}})`. An Opus skeptic refutes each HIGH only with concrete evidence; with `fix: true` one sonnet fixer commits once, then ONE Opus fix-check reads only that fix diff (were the findings fixed? did the diff introduce anything?). Max 2 fix cycles; blockers left after cycle 2, or a fixer that reports the fix as structural, give `structural`: stop patching and decide with the owner. Leftover MEDIUMs go to `medium[]` for cards and never open another review. The delta must include uncommitted step-3 fixes (PCC does not commit): pass `range` as a single rev `<base>` (diff against the working tree) or add `extra: ["HEAD"]` for the uncommitted part. Run `git add -N <new files>` first so `git diff` shows untracked new files, and pass `changedLines` = added+deleted lines from `git diff --numstat <range>`. `range` and each `extra` entry must be a single rev or `a..b` / `a...b` (no spaces, no shell brace expansion; braces only as `@{u}`). Read the returned object: `blocked` or a non-empty `uncovered` is not a ship. `args.round` no longer exists (it throws). Where the Workflow tool is unavailable, apply the same policy by hand: one review, a skeptic per HIGH, one fix batch, a fix-check of the fix diff, two cycles at most.
@@ -175,7 +175,7 @@ Measured: fix rounds that each re-opened a full 3-lens review ran 1-2 days and 2
 | code, >= 100 lines, has a file outside the adapter's `low_risk_paths` | three agents |
 | code, >= 100 lines, otherwise | two agents (correctness, simplify; `security: false`) |
 
-Adapters declare `low_risk_paths:` as one regex line: paths that cannot carry a security defect (prose docs, tests, CSS, raster images). The rule is fail-safe: `security` is true unless EVERY changed file matches it. The caller computes `git diff --name-only <range> | grep -Evq '<low_risk_paths regex>'` (exit 0 -> `security: true`); an unlisted file defaults to security on, and no `low_risk_paths` line -> `security: true`. Agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, `.claude/`) must not be listed as low risk.
+Adapters declare `low_risk_paths:` as one regex line: paths that cannot carry a security defect (prose docs, tests, CSS, raster images). The rule is fail-safe: `security` is true unless EVERY changed file matches it. The caller computes `git diff --no-renames --name-only <range> | grep -Evq '<low_risk_paths regex>'` (exit 0 -> `security: true`); an unlisted file defaults to security on, and no `low_risk_paths` line -> `security: true`. Agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, `.claude/`) must not be listed as low risk.
 
 ## Reuse an expensive step only when its inputs are byte-identical
 
