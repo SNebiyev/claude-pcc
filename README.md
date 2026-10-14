@@ -17,7 +17,7 @@ A commit-gate protocol for Claude Code. Stack-agnostic: JS, Java, Go, Rust, Pyth
 When Claude hears "PCC", it loads this protocol:
 
 - **A missing lane is named, not skipped.** No e2e, no test suite, nothing to start - none of it stalls the run, and none of it hides inside the word "GREEN". Absence has to be proven (a suite you failed to find looks identical to one that does not exist) and then recorded in the adapter, so it is decided once instead of rediscovered every run.
-- **An order that is never rearranged.** Build → services actually come up → fix → review skills → tests → clean build. The code settles first and review runs second, otherwise every fix invalidates the reviews.
+- **An order that is never rearranged.** Build → services actually come up → fix → review (workflow) → tests → clean build. The code settles first and review runs second, otherwise every fix invalidates the reviews.
 - **The speed rule: narrow inside the loop, wide once at the end.** When a gate breaks, fix the offending file and re-check only that file. Running the full suite on an intermediate iteration is a cost that proves nothing.
 - **The review skills get only the current round's delta.** Measured: a seven-round sweep re-read the same 550 KB diff every round, ~800k tokens per round.
 - **A cosmetic finding does not restart the loop.** If it does not change behaviour, it goes to the debt list.
@@ -122,9 +122,25 @@ The mechanical gates stay in the main session on purpose - each is a single whol
 
 **After it:** every later sweep is a normal delta, and the codebase's debt is a list instead of a feeling.
 
+## Review workflow
+
+The sweep's review step is a Claude Code workflow shipped in the plugin (`workflows/pcc-review.js`), called by name from any project:
+
+```
+Workflow({name: "pcc:pcc-review", args: {repo: "/abs/path", range: "<base>..<head>", fix: true}})
+```
+
+What it does: three Opus reviewers (security, correctness, simplify) look at the delta only; an Opus skeptic tries to refute every HIGH and may refute only with concrete evidence; when `fix: true` one sonnet fixer applies the surviving HIGH+MEDIUM findings in a single commit; the fix delta is re-reviewed. At most 2 rounds, then status `structural`. A lens that fails twice is `uncovered` and forces `blocked`.
+
+Args: `repo` (required, absolute path), `range` (required, `base..head`), `extra` (more ranges), `fix`, `lanes` (run the repo's sweep lanes after a ship), `round` (rounds already spent), `context` (short note for the reviewers), `scratch` (base dir for scratch files; default is `mktemp -d`), `limits` (free-text resource rule for probes/tests/builds, e.g. `systemd-run --user --scope -q -p MemoryMax=3G <cmd>`). It returns `{status: ship|blocked|structural, roundsUsed, head, high, medium, debt, refutedHigh, tried, lanes, note, uncovered}`.
+
+Why three agents and not two: measured on the same delta, merging correctness and simplify into one agent cost the same tokens overall and lost the simplify lens - the merged agent ran zero simplify checks, while the separate simplify agent alone found a dead regression test.
+
+Where the Workflow tool does not exist, apply the same policy by hand.
+
 ## Requirements
 
-- Claude Code. It uses the built-in `/security-review`, `/simplify` and `/code-review` skills - there are **no custom skill dependencies**.
+- Claude Code with the Workflow tool for the review step (the baseline's chunked review uses the built-in `/security-review`, `/simplify` and `/code-review` skills). No custom skill dependencies.
 - A git repo with `origin/HEAD` set: `git remote set-head origin -a`
 
 ## Dil haqqında / About language

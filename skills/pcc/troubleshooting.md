@@ -57,7 +57,7 @@ Generated artifacts (an OpenAPI JSON, a snapshot, a lock file) must be excluded 
 
 ## 6. The review skills cannot find a git base
 
-`/security-review`, `/simplify` and `/code-review` work off `origin/HEAD...`:
+The `pcc:pcc-review` workflow takes an explicit `range`, so it is not affected. `/security-review`, `/simplify` and `/code-review` (used by hand, e.g. in a baseline) work off `origin/HEAD...`:
 ```bash
 git remote set-head origin -a
 ```

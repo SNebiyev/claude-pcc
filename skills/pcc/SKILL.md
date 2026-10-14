@@ -25,7 +25,7 @@ cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 | Tier | When | Contents | Target time |
 |---|---|---|---|
 | **gate** | Every commit | compile + typecheck + lint + fast unit tests | seconds to 2 min |
-| **sweep** | End of day, or when a batch of work closes | gate + services actually come up + review skills + full test suite + e2e + clean build | 15-40 min |
+| **sweep** | End of day, or when a batch of work closes | gate + services actually come up + review workflow + full test suite + e2e + clean build | 15-40 min |
 | **baseline** | ONCE, on a repo PCC has never covered | gate over the whole tree + review skills over the codebase in chunks. Output is a debt inventory, not a fix list | hours, once |
 
 🔴 **"PCC" on its own means SWEEP.** Only run `gate` when that word is said. Do not ask. `baseline` is never implicit - it runs only when asked for by name, or when there is no clean point yet and you say so first.
@@ -37,15 +37,13 @@ cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 1. **Read the scope** - `git diff --name-only <clean-point>...HEAD`.
 2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs". A repo with nothing to start (a library, a CLI) skips the live check and says so.
 3. **Fix** - everything found, in **one batch**.
-4. **`/security-review`** - on the delta only.
-5. **`/simplify`** - on the delta only.
-6. **`/code-review`** - on the delta only.
-7. **Tests** - every lane this repo has: full suite, integration, e2e. Name the ones it does not have.
-8. **Final clean build** - with `clean`, because an incremental build can go green off a cache.
+4. **Review** - `Workflow({name: "pcc:pcc-review", args: {repo, range: "<base>..<head>", fix, lanes, context, limits}})`: three Opus reviewers (security, correctness, simplify) on the range only, an Opus skeptic per HIGH (refutes only with concrete evidence), one sonnet fixer that commits once when `fix: true`, at most 2 rounds, then status `structural`. Read the returned object: `blocked` or a non-empty `uncovered` is not a ship. Where the Workflow tool is unavailable (other agents/CLIs), apply the same policy by hand: three separate reviewers, a skeptic per HIGH, one fix batch, two rounds at most.
+5. **Tests** - every lane this repo has: full suite, integration, e2e. Name the ones it does not have.
+6. **Final clean build** - with `clean`, because an incremental build can go green off a cache.
 
-**Why the order matters:** the code settles first, review skills run second, the final build runs last. Reversed, every fix invalidates the reviews and the loop restarts from zero.
+**Why the order matters:** the code settles first, review runs second, the final build runs last. Reversed, every fix invalidates the reviews and the loop restarts from zero.
 
-The review skills need a git base - if `origin/HEAD` is unset, run `git remote set-head origin -a` first.
+The workflow takes an explicit `range`, so it needs no `origin/HEAD`. Only the baseline's by-hand review skills do - if `origin/HEAD` is unset, run `git remote set-head origin -a` first.
 
 ## A lane the project does not have
 
