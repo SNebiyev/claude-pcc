@@ -5,8 +5,9 @@
 //            (a single rev = <base> against the WORKING TREE, so uncommitted edits are in the delta; run
 //            `git add -N <new files>` first, otherwise untracked files are invisible to git diff)
 //   extra?   more ranges to review in the same round (array, same forms as range)
-//   changedLines? non-negative integer: sum of added+deleted lines of `git diff --numstat <range>` (new files included).
-//            < 100 -> ONE reviewer covers security+correctness+simplify; missing or >= 100 -> three separate reviewers
+//   changedLines? non-negative integer: sum of added+deleted lines of `git diff --numstat <range>` (new files included via `git add -N`).
+//            ONE reviewer covers security+correctness+simplify only when changedLines < 100 AND extra is empty; missing,
+//            >= 100, or any extra entry -> three separate reviewers. Round 2 uses the fixer's own changedLines for base..head.
 //   fix?     true -> one sonnet fixer commits once for the surviving HIGH+MEDIUM findings
 //   lanes?   true -> after a ship verdict, run the repo's PCC sweep lanes per <repo>/.claude/pcc.md
 //   round?   non-negative integer: review rounds already spent on this batch (budget is 2 in total)
@@ -45,9 +46,20 @@ const A = args || {}
 const repo = A.repo
 const baseRange = A.range
 if (!repo || !baseRange) throw new Error('pcc-review: args.repo and args.range are required')
-const REV_RE = /^[\w.\/~^@{}-]+(\.\.\.?[\w.\/~^@{}-]+)?$/
+// a rev is one side, or two sides split on the FIRST '...' / '..'; braces only in the @{...} form (no shell brace expansion)
+const REV_SIDE = /^(?:[\w\/^~.-]|@\{[\w.-]*\})+$/
 function checkRev(x, what) {
-  if (typeof x !== 'string' || !REV_RE.test(x) || x.startsWith('-')) throw new Error(`pcc-review: ${what} must be a single rev or a..b / a...b, got ${JSON.stringify(x)}`)
+  const bad = () => new Error(`pcc-review: ${what} must be a single rev or a..b / a...b, got ${JSON.stringify(x)}`)
+  if (typeof x !== 'string') throw bad()
+  const i2 = x.indexOf('..')
+  let sides = [x]
+  if (i2 !== -1) {
+    const sep = x.startsWith('...', i2) ? '...' : '..'
+    sides = [x.slice(0, i2), x.slice(i2 + sep.length)]
+  }
+  for (const side of sides) {
+    if (!side || side.includes('..') || side.startsWith('-') || side.startsWith('~') || !REV_SIDE.test(side)) throw bad()
+  }
 }
 function parseCount(v, what) {
   if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return v
@@ -119,6 +131,7 @@ const FIX_SCHEMA = {
     head: { type: 'string', description: '40-hex sha of your commit' },
     base: { type: 'string', description: 'sha of HEAD before your commit' },
     summary: { type: 'string', description: '<= 60 words' },
+    changedLines: { type: 'integer', minimum: 0, description: 'added+deleted lines of `git diff --numstat <base>..<head>` for your commit' },
     testsRun: { type: 'array', items: { type: 'string' } },
     concerns: { type: 'array', items: { type: 'string' } },
   },
@@ -157,14 +170,19 @@ const LENS_TEXT = {
 }
 
 // one agent per lens; measured 2026-10-15 on the same delta: merging correctness+simplify into one agent cost the same tokens overall and lost the simplify lens (the merged agent ran zero simplify checks; the separate simplify agent alone had found a dead regression test)
-// small deltas use one agent because each agent has a ~60-65k token floor (owner decision 2026-10-15)
-const SMALL = changedLines !== null && changedLines < SMALL_DELTA_LINES
-const LENS_GROUPS = SMALL ? [['security', 'correctness', 'simplify']] : [['security'], ['correctness'], ['simplify']]
-log(SMALL
-  ? `mode: one reviewer for all three lenses (changedLines=${changedLines} < ${SMALL_DELTA_LINES})`
-  : `mode: three separate reviewers (${changedLines === null ? 'changedLines not given' : `changedLines=${changedLines} >= ${SMALL_DELTA_LINES}`})`)
-const triedUsable = (x, g) => !!x && !!x.tried && typeof x.tried === 'object' &&
-  g.every(l => Array.isArray(x.tried[l]) && x.tried[l].some(t => typeof t === 'string' && t.trim() !== ''))
+// three separate reviewers (one combined reviewer when changedLines < 100 and no extra): each agent has a ~60-65k token floor (owner decision 2026-10-15)
+// small mode needs a known small delta AND no extra ranges (changedLines does not cover extra)
+function groupsFor(lines, roundNo) {
+  const small = lines !== null && lines < SMALL_DELTA_LINES && extra.length === 0
+  log(small
+    ? `r${roundNo}: mode: one reviewer for all three lenses (changedLines=${lines} < ${SMALL_DELTA_LINES}, no extra)`
+    : `r${roundNo}: mode: three separate reviewers (${extra.length ? 'extra ranges given' : lines === null ? 'changedLines not given' : `changedLines=${lines} >= ${SMALL_DELTA_LINES}`})`)
+  return small ? [['security', 'correctness', 'simplify']] : [['security'], ['correctness'], ['simplify']]
+}
+const cleanTried = (x, l) => x && x.tried && typeof x.tried === 'object' && Array.isArray(x.tried[l])
+  ? x.tried[l].filter(t => typeof t === 'string' && t.trim() !== '') : []
+// usable = findings is an array (never silently treated as clean) and every lens has a non-blank tried entry
+const triedUsable = (x, g) => !!x && Array.isArray(x.findings) && g.every(l => cleanTried(x, l).length > 0)
 
 function reviewPrompt(lenses, range, roundNo) {
   const scopeRanges = [range].concat(extra)
@@ -214,7 +232,7 @@ function fixPrompt(items) {
     NO_EXTERNAL,
     'Commit rules: English message with a conventional prefix (fix(scope): ...); never push, never amend, never rebase, no git checkout/restore of work files. Do not pkill/killall; no docker/servers. Run long commands in the foreground.',
     'If you decide to skip, disable, or weaken anything, or accept a risk, list it in concerns.',
-    'Return head (the 40-hex sha of your commit), base (sha before it), summary (<= 60 words), testsRun, concerns.',
+    'Return head (the 40-hex sha of your commit), base (sha before it), summary (<= 60 words), changedLines (integer: added+deleted lines summed from `git diff --numstat <base>..<head>` after your commit), testsRun, concerns.',
   ].join('\n')
 }
 
@@ -239,6 +257,7 @@ let range = baseRange
 let status = null
 let lanes = null
 let note = null
+let roundLines = changedLines
 const uncovered = []
 
 if (startRound >= MAX_ROUNDS) {
@@ -253,39 +272,45 @@ while (!status) {
   roundsUsed++
 
   phase('Review')
-  const reports = await parallel(LENS_GROUPS.map(g => async () => {
+  const groups = groupsFor(roundLines, roundNo)
+  // a throwing agent counts as a null attempt, so the retry runs
+  const ask = async (g, label) => {
+    try { return await agent(reviewPrompt(g, range, roundNo), { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g), label }) } catch (e) { return null }
+  }
+  const reports = await parallel(groups.map(g => async () => {
     const gk = g.join('+')
-    const opts = { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g) }
-    const attempts = [await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${gk}` })]
+    const attempts = [await ask(g, `r${roundNo}:${gk}`)]
     if (!triedUsable(attempts[0], g)) {
-      log(`r${roundNo}: reviewer ${gk} returned nothing or unusable tried coverage, retrying once (findings of both attempts are kept)`)
-      attempts.push(await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${gk}:retry` }))
+      log(`r${roundNo}: reviewer ${gk} returned nothing, non-array findings or unusable tried coverage, retrying once (findings of both attempts are kept)`)
+      attempts.push(await ask(g, `r${roundNo}:${gk}:retry`))
     }
-    return { g, attempts }
+    return { g, gk, attempts }
   }))
 
   const raw = []
-  for (const rep of reports) {
-    const gk = rep.g.join('+')
+  groups.forEach((g, i) => {
+    const rep = reports[i] || { g, gk: g.join('+'), attempts: [] } // a missing report is an uncovered group, never a crash or a ship
     if (!rep.attempts.some(x => triedUsable(x, rep.g))) {
       uncovered.push(...rep.g)
-      log(`r${roundNo}: lens uncovered after retry: ${gk} -> final status will be blocked (its findings are still processed)`)
+      log(`r${roundNo}: lens uncovered after retry: ${rep.gk} -> final status will be blocked (its findings are still processed)`)
     }
+    const seen = new Set() // exact duplicates (severity, file, line, title) of an earlier attempt are dropped
     for (const x of rep.attempts) {
       if (!x) continue
       for (const l of rep.g) {
-        const list = x.tried && Array.isArray(x.tried[l]) ? x.tried[l].filter(t => typeof t === 'string' && t.trim() !== '') : []
         if (!tried[l]) tried[l] = []
-        tried[l].push(...list.map(t => `r${roundNo}: ${t}`))
+        tried[l].push(...cleanTried(x, l).map(t => `r${roundNo}: ${t}`))
       }
-      if (Array.isArray(x.findings)) raw.push(...x.findings.map(fd => ({ ...fd, lens: gk })))
+      if (!Array.isArray(x.findings)) continue
+      const keys = x.findings.map(fd => JSON.stringify([fd.severity, fd.file, fd.line, fd.title]))
+      x.findings.forEach((fd, j) => { if (!seen.has(keys[j])) raw.push({ ...fd, lens: rep.gk }) })
+      keys.forEach(k => seen.add(k))
     }
-  }
+  })
   if (!raw.length) log(`r${roundNo}: no findings from any lens`)
-  const merged = raw
-  const highs = merged.filter(f => f.severity === 'HIGH')
-  const mediums = merged.filter(f => f.severity === 'MEDIUM')
-  debt.push(...merged.filter(f => f.severity === 'LOW'))
+  const highs = raw.filter(f => f.severity === 'HIGH')
+  const mediums = raw.filter(f => f.severity === 'MEDIUM')
+  debt.push(...raw.filter(f => f.severity === 'LOW'))
 
   phase('Verify')
   let survivors = []
@@ -352,6 +377,7 @@ while (!status) {
   }
   if (fx.concerns && fx.concerns.length) log(`r${roundNo}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)
   head = fx.head
+  roundLines = Number.isInteger(fx.changedLines) && fx.changedLines >= 0 ? fx.changedLines : null
   range = `${fx.base}..${fx.head}`
   extra.length = 0 // the fix delta is reviewed alone; earlier ranges were already reviewed
   log(`r${roundNo}: fixed ${actionable.length} finding(s) in ${range}; next round reviews only this delta`)

@@ -19,14 +19,16 @@ function shape(res, schema) {
     for (const l of lenses) tried[l] = l in map ? map[l] : ['t']
     return { findings: res.findings, tried }
   }
-  return { findings: res.findings, tried: Object.values(map).flat().length || !Object.keys(map).length ? (Object.keys(map).length ? Object.values(map).flat() : ['t']) : [] }
+  return { findings: res.findings, tried: Object.keys(map).length ? Object.values(map).flat() : ['t'] }
 }
 
 function run(args, handler) {
   const calls = []
   const prompts = {}
-  const agent = async (prompt, o) => { calls.push(o.label); prompts[o.label] = prompt; return shape(handler(o.label, prompt), o.schema) }
-  const parallel = fns => Promise.all(fns.map(f => f()))
+  // {raw: X} from a handler is returned to the script unshaped; a handler that throws makes the agent call reject
+  const agent = async (prompt, o) => { calls.push(o.label); prompts[o.label] = prompt; const h = handler(o.label, prompt); return h && 'raw' in h && Object.keys(h).length === 1 ? h.raw : shape(h, o.schema) }
+  // like the real parallel(): a thunk that throws yields null instead of rejecting
+  const parallel = fns => Promise.all(fns.map(f => f().catch(() => null)))
   return new AsyncFn('args', 'agent', 'parallel', 'phase', 'log', src)(args, agent, parallel, () => {}, () => {}).then(r => ({ r, calls, prompts }))
 }
 const A = { repo: '/x', range: 'a..b' }
@@ -87,7 +89,7 @@ test('BUG retry: attempt-1 HIGH with empty tried + clean retry keeps and verifie
 
 test('BUG retry: both attempts unusable -> lens uncovered, blocked, findings still kept', async () => {
   const { r } = await run(A, l => {
-    if (l.startsWith('r1:security')) return { findings: [f('MEDIUM', 'a.js', 10, 'm1')], tried: { security: [] } }
+    if (l.startsWith('r1:security')) return { findings: [f('MEDIUM', 'a.js', 10, l.endsWith(':retry') ? 'm2' : 'm1')], tried: { security: [] } }
     return clean()
   })
   assert.equal(r.status, 'blocked')
@@ -147,7 +149,7 @@ test('BUG small delta: merged agent with one lens tried empty -> retry, then unc
   const b = await run({ ...A, changedLines: 50 }, () => ({ findings: [f('LOW', 'a.js', 1, 'l')], tried: { simplify: [] } }))
   assert.equal(b.r.status, 'blocked')
   assert.deepEqual(b.r.uncovered.sort(), ['correctness', 'security', 'simplify'])
-  assert.equal(b.r.debt.length, 2)
+  assert.equal(b.r.debt.length, 1) // the identical finding of the retry is an exact duplicate
   assert.equal(b.r.debt[0].lens, 'security+correctness+simplify')
 })
 
@@ -193,4 +195,82 @@ test('BUG lanes: one pass + one skipped -> ship, note lists the skipped lane', a
     ? { verdict: 'green', lanes: [{ name: 'unit', result: 'pass', evidence: '' }, { name: 'e2e', result: 'skipped', evidence: '' }] } : clean())
   assert.equal(r.status, 'ship')
   assert.match(r.note, /lanes skipped: e2e/)
+})
+
+const FULL = ['security', 'correctness', 'simplify']
+
+test('ITEM1 reviewer throws -> retry runs and covers the lens', async () => {
+  const { r, calls } = await run(A, l => { if (l === 'r1:security') throw new Error('boom'); return clean() })
+  assert.ok(calls.includes('r1:security:retry'))
+  assert.equal(r.status, 'ship')
+  assert.deepEqual(r.uncovered, [])
+})
+
+test('ITEM1 reviewer throws twice -> uncovered, blocked, no crash', async () => {
+  const { r } = await run(A, l => { if (l.startsWith('r1:security')) throw new Error('boom'); return clean() })
+  assert.equal(r.status, 'blocked')
+  assert.deepEqual(r.uncovered, ['security'])
+  const all = await run({ ...A, changedLines: 5 }, () => { throw new Error('boom') })
+  assert.equal(all.r.status, 'blocked')
+  assert.deepEqual(all.r.uncovered.sort(), FULL.slice().sort())
+})
+
+test('ITEM2 non-array findings with usable tried are unusable -> retry -> uncovered, blocked', async () => {
+  for (const bad of [null, 'none', {}]) {
+    const { r, calls } = await run(A, l => l.startsWith('r1:security') ? { raw: { findings: bad, tried: { security: ['x'] } } } : clean())
+    assert.ok(calls.includes('r1:security:retry'), JSON.stringify(bad))
+    assert.equal(r.status, 'blocked', JSON.stringify(bad))
+    assert.deepEqual(r.uncovered, ['security'])
+  }
+  const ok = await run(A, l => l === 'r1:security' ? { raw: { findings: null, tried: { security: ['x'] } } } : clean())
+  assert.equal(ok.r.status, 'ship') // a usable retry covers the lens
+})
+
+test('ITEM3 small mode is off whenever extra is given', async () => {
+  const { calls } = await run({ ...A, changedLines: 10, extra: ['HEAD'] }, clean)
+  assert.deepEqual(reviews(calls).sort(), ['r1:correctness', 'r1:security', 'r1:simplify'])
+  const one = await run({ ...A, changedLines: 10, extra: [] }, clean)
+  assert.equal(reviews(one.calls).length, 1)
+})
+
+test('ITEM4 rev validity table', async () => {
+  const valid = ['HEAD', 'HEAD~2', 'abc123^', 'main@{u}', 'a..b', 'a...b', 'origin/main..HEAD']
+  const invalid = ['', '..', '...', 'a..', '..b', 'a..b..c', '{a..c}', '{1..9}', '{1..99999999}', '~root', '-x', '--output=x', 'a b', 'a;b']
+  for (const x of valid) {
+    await run({ ...A, range: x }, clean)
+    await run({ ...A, extra: [x] }, clean)
+  }
+  for (const x of invalid) {
+    await assert.rejects(run({ ...A, range: x }, clean), /range|required/, `range ${JSON.stringify(x)}`)
+    await assert.rejects(run({ ...A, extra: [x] }, clean), /extra/, `extra ${JSON.stringify(x)}`)
+  }
+})
+
+test('ITEM5 round 2 mode follows the fixer changedLines', async () => {
+  const base = l => l === 'r1:correctness' ? { findings: [f('MEDIUM', 'a.js', 1, 'm')] } : clean()
+  const fixer = cl => ({ head: H40('b'), base: H40('a'), summary: '', testsRun: [], concerns: [], ...(cl === undefined ? {} : { changedLines: cl }) })
+  const small = await run({ ...A, fix: true, changedLines: 500 }, l => l.includes(':fix') ? fixer(20) : base(l))
+  assert.deepEqual(reviews(small.calls).filter(c => c.startsWith('r2')), ['r2:security+correctness+simplify'])
+  for (const cl of [undefined, 150, -1, '20', 1.5]) {
+    const big = await run({ ...A, fix: true, changedLines: 500 }, l => l.includes(':fix') ? fixer(cl) : base(l))
+    assert.deepEqual(reviews(big.calls).filter(c => c.startsWith('r2')).sort(), ['r2:correctness', 'r2:security', 'r2:simplify'], String(cl))
+  }
+})
+
+test('ITEM6 exact duplicate across attempts is dropped; near-duplicates are kept', async () => {
+  const { r, calls } = await run(A, l => {
+    if (l === 'r1:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
+    if (l === 'r1:security:retry') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 11, 'xss')] }
+    if (l.includes('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(calls.filter(c => c.includes(':verify')).length, 2)
+  assert.equal(r.high.length, 2)
+})
+
+test('ITEM10 small mode: tried missing a lens key -> retry -> uncovered, blocked', async () => {
+  const { r, calls } = await run({ ...A, changedLines: 5 }, () => ({ raw: { findings: [], tried: { security: ['a'], correctness: ['b'] } } }))
+  assert.equal(reviews(calls).length, 2)
+  assert.equal(r.status, 'blocked')
+  assert.deepEqual(r.uncovered.sort(), FULL.slice().sort())
 })
