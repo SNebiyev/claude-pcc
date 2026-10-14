@@ -44,7 +44,8 @@ const extra = Array.isArray(A.extra) ? A.extra : []
 const doFix = A.fix === true
 const doLanes = A.lanes === true
 const context = String(A.context || '').slice(0, 800)
-const startRound = Number.isInteger(A.round) ? A.round : 0
+const startRound = (A.round === undefined || A.round === null) ? 0 : Number(A.round)
+if (!Number.isInteger(startRound) || startRound < 0) throw new Error('pcc-review: args.round must be a non-negative integer, got ' + JSON.stringify(A.round))
 const scratchBase = A.scratch ? String(A.scratch).replace(/\/+$/, '') : ''
 const limits = A.limits ? String(A.limits) : ''
 const LIMITS_FALLBACK = `If ${repo}/.claude/pcc.md states memory/CPU limits for probes, tests or builds, follow them.`
@@ -153,6 +154,7 @@ function reviewPrompt(lenses, range, roundNo) {
     '- No docker, no servers, no Playwright. Never pkill/killall. Run long commands in the foreground.',
     '- Do not edit tracked files. ' + scratchRule(`pcc-review-${lenses.join('+')}-r${roundNo}`),
     '- ' + NO_EXTERNAL,
+    'If the range is empty, invalid, or the diff shows nothing, report that as a HIGH finding (file "-", line 0): an unreadable delta is not a clean delta.',
     'Severity: HIGH = server CPU/memory DoS reachable by any user, XSS/unsafe content reaching another user, data loss, auth bypass, or a correctness bug normal users hit. MEDIUM = real but limited to the user\'s own tab or needing unusual input. LOW = cleanup.',
     `Report short: at most ${MAX_FINDINGS} findings (title <= 15 words, evidence <= 50 words with exact input/measurement, fix <= 30 words) and always a "tried" list (<= ${MAX_TRIED} items, <= 15 words each) of the attack/check shapes you tried, even when you found nothing. An empty finding list with no "tried" entries is not accepted.`,
   ].filter(Boolean).join('\n')
@@ -177,6 +179,7 @@ function fixPrompt(items) {
     'Fix every finding below (all are verified HIGH or MEDIUM). Keep each change minimal and behaviour-preserving apart from the fix.',
     'Findings:',
     ...items.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line} - ${f.title}\n   evidence: ${f.evidence}\n   suggested fix: ${f.fix}`),
+    'Stage and commit ONLY the files you change for these findings (git add <paths>; never git add -A / commit -a); leave any other uncommitted changes in the tree untouched.',
     'Steps: record `git rev-parse HEAD` as base; make the fixes; add or adjust tests; run ONLY the touched tests; commit ONCE.',
     limitsRule,
     NO_EXTERNAL,
@@ -201,11 +204,11 @@ function dedup(list) {
   const kept = []
   let dropped = 0
   for (const f of sorted) {
-    const dup = kept.find(k => k.file === f.file && Math.abs(k.line - f.line) <= LINE_WINDOW)
+    const dup = kept.find(k => k.lens === f.lens && k.file === f.file && Math.abs(k.line - f.line) <= LINE_WINDOW)
     if (dup) { dropped++; continue }
     kept.push(f)
   }
-  if (dropped) log(`dedup: merged ${dropped} duplicate finding(s) (same file, line +-${LINE_WINDOW}, kept higher severity)`)
+  if (dropped) log(`dedup: merged ${dropped} duplicate finding(s) (same lens, same file, line +-${LINE_WINDOW}, kept higher severity)`)
   return kept
 }
 
@@ -239,10 +242,12 @@ while (!status) {
     (async () => {
       const opts = { phase: 'Review', model: REVIEW_MODEL, schema: FINDINGS_SCHEMA }
       let r = await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${g.join('+')}` })
-      if (!r) {
-        log(`r${roundNo}: reviewer ${g.join('+')} returned nothing, retrying once`)
+      const unusable = x => !x || !Array.isArray(x.tried) || x.tried.length === 0
+      if (unusable(r)) {
+        log(`r${roundNo}: reviewer ${g.join('+')} returned nothing or an empty tried list, retrying once`)
         r = await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${g.join('+')}:retry` })
       }
+      if (unusable(r)) r = null
       return { g, r }
     })()))
 
@@ -253,7 +258,7 @@ while (!status) {
     const gk = rep.g.join('+')
     if (!tried[gk]) tried[gk] = []
     tried[gk].push(...rep.r.tried.map(t => `r${roundNo}: ${t}`))
-    raw.push(...rep.r.findings)
+    raw.push(...rep.r.findings.map(f => ({ ...f, lens: gk })))
   }
   if (!raw.length) log(`r${roundNo}: no findings from any lens`)
   const merged = dedup(raw)
@@ -318,10 +323,10 @@ while (!status) {
     model: FIX_MODEL,
     schema: FIX_SCHEMA,
   })
-  if (!fx || !/^[0-9a-f]{40}$/.test(fx.head) || !fx.base) {
-    log(`r${roundNo}: fixer failed or returned a bad sha; stopping with findings unfixed`)
-    status = survivors.length ? 'blocked' : 'ship'
-    note = 'fixer failed'
+  if (!fx || !/^[0-9a-f]{40}$/.test(fx.head) || !/^[0-9a-f]{40}$/.test(fx.base) || fx.base === fx.head) {
+    log(`r${roundNo}: fixer failed or returned a bad/empty sha range; the fixer may have committed unreviewed code -> blocked`)
+    status = 'blocked'
+    note = 'fixer failed or returned a bad sha range; HEAD may hold an unreviewed commit - inspect or revert HEAD before shipping'
     break
   }
   if (fx.concerns && fx.concerns.length) log(`r${roundNo}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)
@@ -351,8 +356,9 @@ if (status === 'ship' && doLanes) {
     model: LANES_MODEL,
     schema: LANES_SCHEMA,
   })
-  if (!lanes || lanes.verdict !== 'green') {
-    log('lanes: red or no result -> status blocked')
+  const laneList = lanes && Array.isArray(lanes.lanes) ? lanes.lanes : []
+  if (!lanes || lanes.verdict !== 'green' || !laneList.length || laneList.some(l => l.result === 'fail')) {
+    log('lanes: red, failed lane, empty lanes or no result -> status blocked')
     status = 'blocked'
   }
 } else if (doLanes) {
