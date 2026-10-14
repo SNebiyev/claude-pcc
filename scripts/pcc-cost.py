@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 CLASSES = [  # first match wins
-    ("review", re.compile(r"review|audit|security|refute|simplif|correctness|verify|skeptic|fix-check", re.I)),
+    ("review", re.compile(r"review|audit|security|refute|simplif|correctness|verify|skeptic|fix-?check", re.I)),
     ("fix", re.compile(r"fix|implement|patch", re.I)),
     ("lanes", re.compile(r"pcc|lane|e2e|playwright|sweep|flake", re.I)),
 ]
@@ -24,7 +24,7 @@ def classify(desc, path):
     return "other"
 
 def read_agent(p):
-    first = last = None; tokens = 0; floor = None; seen = set()
+    first = last = None; floor = None; usage = {}
     for line in p.open(errors="replace"):
         try:
             d = json.loads(line)
@@ -38,13 +38,15 @@ def read_agent(p):
         if not u:
             continue
         key = m.get("id") or d.get("uuid")
-        if key in seen:
-            continue
-        seen.add(key)
         base = (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0)
-        tokens += base + (u.get("output_tokens") or 0)
-        if floor is None:
-            floor = base + (u.get("cache_read_input_tokens") or 0)
+        out = u.get("output_tokens") or 0
+        if key not in usage:  # first record of a message id sets the context floor
+            if floor is None:
+                floor = base + (u.get("cache_read_input_tokens") or 0)
+        elif out < usage[key][1]:
+            continue  # streaming records of one id: the last (largest output) is final
+        usage[key] = (base, out)
+    tokens = sum(b + o for b, o in usage.values())
     return first, last, tokens, floor
 
 def main():

@@ -210,9 +210,10 @@ function groupsFor(lines) {
   const why = small
     ? `changedLines=${lines} < ${SMALL_DELTA_LINES}, no extra`
     : extra.length ? 'extra ranges given' : lines === null ? 'changedLines not given' : `changedLines=${lines} >= ${SMALL_DELTA_LINES}`
-  const lenses = useSecurity ? ['security', 'correctness', 'simplify'] : ['correctness', 'simplify']
+  // small delta: one agent always carries all 3 lenses; security=false only drops the security agent of a large delta
+  const lenses = small || useSecurity ? ['security', 'correctness', 'simplify'] : ['correctness', 'simplify']
   log(`mode: ${small ? 'one reviewer for ' + lenses.join('+') : 'separate reviewers per lens (' + lenses.join(', ') + ')'} (${why})` +
-    (useSecurity ? '' : '; security lens off: caller passed security=false'))
+    (small || useSecurity ? '' : '; security lens off: caller passed security=false'))
   return { mode: small ? 'small' : 'large', groups: small ? [lenses] : lenses.map(l => [l]) }
 }
 const cleanList = a => Array.isArray(a) ? a.filter(t => typeof t === 'string' && t.trim() !== '') : []
@@ -403,10 +404,15 @@ while (!status) {
   phase('Fix')
   const fx = await guard(fixPrompt(items), { label: `fix:${fixCycles}`, phase: 'Fix', model: FIX_MODEL, schema: FIX_SCHEMA })
   if (fx && fx.structural === true) {
-    status = 'structural'
+    const hasHigh = items.some(f => f.severity === 'HIGH')
+    status = hasHigh ? 'structural' : 'ship' // the severity gate: a MEDIUM never blocks, only a HIGH goes structural
     note = `fixer says the fix is structural: ${fx.reason || 'no reason given'}`
-    if (fx.head !== fx.base) note += ' - WARNING: the fixer committed anyway (head != base); inspect HEAD'
-    else note += ' (no commit made, HEAD == base)'
+    if (!hasHigh) note += ' (MEDIUM-only batch: not blocking, shipping with medium[])'
+    if (fx.head !== fx.base) {
+      note += ' - WARNING: the fixer committed anyway (head != base); inspect HEAD'
+      if (!hasHigh) status = 'blocked' // an unreviewed commit is never shipped
+    } else note += ' (no commit made, HEAD == base)'
+    if (!hasHigh) { high = []; medium = items }
     log(`${cyc}: ${note}`)
     break
   }
@@ -414,6 +420,13 @@ while (!status) {
     log(`${cyc}: fixer failed or returned a bad/empty sha range; the fixer may have committed unreviewed code -> blocked`)
     status = 'blocked'
     note = 'fixer failed or returned a bad sha range; HEAD may hold an unreviewed commit - inspect or revert HEAD before shipping'
+    break
+  }
+  if (!Number.isInteger(fx.changedLines) || fx.changedLines > FIX_STRUCTURAL_LINES) {
+    status = 'structural'
+    note = `fixer's commit is ${Number.isInteger(fx.changedLines) ? fx.changedLines + ' changed lines (> ' + FIX_STRUCTURAL_LINES + ')' : 'of unreported size (changedLines missing)'}: a redesign, not a fix; HEAD holds an unreviewed commit - inspect or revert it`
+    head = fx.head
+    log(`${cyc}: ${note}`)
     break
   }
   if (fx.concerns && fx.concerns.length) log(`${cyc}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)

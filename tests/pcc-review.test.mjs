@@ -258,7 +258,7 @@ test('ITEM10 small mode: tried missing a lens key -> retry -> uncovered, blocked
 })
 
 // ---------------------------------------------------------------- v2
-const FX = (over = {}) => ({ head: H40('b'), base: H40('a'), summary: '', testsRun: [], concerns: [], ...over })
+const FX = (over = {}) => ({ head: H40('b'), base: H40('a'), changedLines: 10, summary: '', testsRun: [], concerns: [], ...over })
 const chk = (results, newFindings = [], tried = ['t']) => ({ raw: { results, newFindings, tried } })
 const ok = i => ({ index: i, fixed: true, note: 'n' })
 const notOk = i => ({ index: i, fixed: false, note: 'n' })
@@ -278,9 +278,9 @@ test('v2 tier docs -> one docs+simplify agent', async () => {
   assert.equal(r.status, 'ship')
 })
 
-test('v2 security=false: small -> correctness+simplify; large -> two agents', async () => {
+test('v2 security=false: small keeps all 3 lenses; large -> two agents', async () => {
   const s = await run({ ...A, security: false, changedLines: 10 }, clean)
-  assert.deepEqual(reviews(s.calls), ['review:correctness+simplify'])
+  assert.deepEqual(reviews(s.calls), ['review:security+correctness+simplify'])
   assert.equal(s.r.mode, 'small')
   const l = await run({ ...A, security: false, changedLines: 400 }, clean)
   assert.deepEqual(reviews(l.calls).sort(), ['review:correctness', 'review:simplify'])
@@ -383,6 +383,23 @@ test('v2 fixer structural=true -> structural with its reason', async () => {
   assert.ok(!calls.some(c => c.startsWith('fixcheck')))
   const bad = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mkHigh(l))
   assert.match(bad.r.note, /WARNING/)
+})
+
+test('v2 fixer commit over the line limit or without changedLines -> structural', async () => {
+  for (const over of [{ changedLines: 400 }, { changedLines: undefined }]) {
+    const { r, calls } = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX(over) : mkHigh(l))
+    assert.equal(r.status, 'structural')
+    assert.ok(!calls.some(c => c.startsWith('fixcheck')))
+  }
+})
+
+test('v2 fixer structural=true on a MEDIUM-only batch ships with medium[]', async () => {
+  const { r } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX({ structural: true, reason: 'big', head: H40('a') })
+    return l === 'review:correctness' ? { findings: [f('MEDIUM', 'a.js', 1, 'm')] } : clean()
+  })
+  assert.equal(r.status, 'ship')
+  assert.equal(r.medium.length, 1)
 })
 
 test('v2 fix-check unusable twice -> blocked, uncovered has fix-check', async () => {
