@@ -24,12 +24,12 @@ If the file is missing, the skill works out the stack itself (`package.json`, `b
 <clean build>                # e.g. ./gradlew clean build
 ```
 
-## Security paths
+## Low-risk paths
 
-One regex line. When a delta touches none of these paths the review skips the security lens (`security: false`); no line means the lens always runs.
+One regex line of paths that cannot carry a security defect. The review skips the security lens (`security: false`) only when EVERY changed file matches; any other file, or no line, means the lens runs. Caller formula: `git diff --name-only <range> | grep -Evq '<regex>'` (exit 0 -> security=true). Do not list agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, .claude/) as low risk.
 
 ```
-security_paths: ^(src/auth/|src/api/|migrations/|.*\.sql$)
+low_risk_paths: (\.md$|_test\.go$|\.(test|spec)\.(ts|tsx)$|^e2e/|\.css$|\.(png|jpe?g|webp|gif|ico)$)
 ```
 
 ## Lanes this repo does NOT have

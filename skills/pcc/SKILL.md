@@ -172,10 +172,10 @@ Measured: fix rounds that each re-opened a full 3-lens review ran 1-2 days and 2
 |---|---|
 | docs / agent or policy text (`tier: "docs"`) | one agent: docs + simplify |
 | code, < 100 changed lines, no `extra` | one agent: security + correctness + simplify |
-| code, >= 100 lines, touches the adapter's `security_paths` | three agents |
+| code, >= 100 lines, has a file outside the adapter's `low_risk_paths` | three agents |
 | code, >= 100 lines, otherwise | two agents (correctness, simplify; `security: false`) |
 
-Adapters declare `security_paths:` as one regex line. The caller computes `security` with `git diff --name-only <range> | grep -Eq '<regex>'`; no `security_paths` line -> `security: true`.
+Adapters declare `low_risk_paths:` as one regex line: paths that cannot carry a security defect (prose docs, tests, CSS, raster images). The rule is fail-safe: `security` is true unless EVERY changed file matches it. The caller computes `git diff --name-only <range> | grep -Evq '<low_risk_paths regex>'` (exit 0 -> `security: true`); an unlisted file defaults to security on, and no `low_risk_paths` line -> `security: true`. Agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, `.claude/`) must not be listed as low risk.
 
 ## Reuse an expensive step only when its inputs are byte-identical
 

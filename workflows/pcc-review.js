@@ -10,7 +10,7 @@
 //            code tier: ONE reviewer covers all lenses only when changedLines < 100 AND extra is empty; missing,
 //            >= 100, or any extra entry -> separate reviewers per lens.
 //   tier?    'code' (default) | 'docs'. docs = one reviewer with lenses docs+simplify (docs, README, agent/policy text).
-//   security? boolean, default true. false drops the security lens (caller: no file of the delta matches the adapter's security_paths).
+//   security? boolean, default true. false drops the security lens (caller: every file of the delta matches the adapter's low_risk_paths; otherwise true).
 //   fix?     true -> a sonnet fixer commits once for the surviving HIGH+MEDIUM findings, then ONE opus fix-check reads only that
 //            fix diff. Max 2 fix cycles; blockers left after cycle 2 -> 'structural'.
 //   lanes?   true -> after a ship verdict, run the repo's PCC sweep lanes per <repo>/.claude/pcc.md
