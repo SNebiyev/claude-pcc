@@ -1,17 +1,23 @@
 // pcc-review - PCC review cycle for a delta. Call: Workflow({name: "pcc:pcc-review", args: {...}})
 // args:
 //   repo     (required) absolute path of the repo
-//   range    (required) "<base>..<head>" - the delta to review
-//   extra?   more ranges to review in the same round (array of "<base>..<head>")
+//   range    (required) the delta to review: "<base>..<head>" / "<base>...<head>", or a single rev "<base>"
+//            (a single rev = <base> against the WORKING TREE, so uncommitted edits are in the delta; run
+//            `git add -N <new files>` first, otherwise untracked files are invisible to git diff)
+//   extra?   more ranges to review in the same round (array, same forms as range)
+//   changedLines? non-negative integer: sum of added+deleted lines of `git diff --numstat <range>` (new files included).
+//            < 100 -> ONE reviewer covers security+correctness+simplify; missing or >= 100 -> three separate reviewers
 //   fix?     true -> one sonnet fixer commits once for the surviving HIGH+MEDIUM findings
 //   lanes?   true -> after a ship verdict, run the repo's PCC sweep lanes per <repo>/.claude/pcc.md
-//   round?   number of review rounds already spent on this batch (budget is 2 in total)
+//   round?   non-negative integer: review rounds already spent on this batch (budget is 2 in total)
 //   context? short caller note for the reviewers (cut to 800 chars)
 //   scratch? base dir for agent scratch files; without it each agent makes its own with mktemp -d
 //   limits?  free text, a binding resource rule for probes/tests/builds, e.g.
 //            "probes: systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 <cmd>; tests/builds: MemoryMax=6G"
+// After round 2 a surviving HIGH gives 'structural'; MEDIUM-only gives 'ship' with medium[] returned UNFIXED
+// (a fix after the last review would be unreviewed code).
 // returns { status: 'ship'|'blocked'|'structural', roundsUsed, head, high, medium, debt, refutedHigh,
-//           tried, lanes, note, uncovered }. 'blocked' or a non-empty `uncovered` is not a ship.
+//           tried, lanes, note, uncovered }. tried is keyed by lens (security/correctness/simplify) in both modes. 'blocked' or a non-empty `uncovered` is not a ship.
 
 export const meta = {
   name: 'pcc-review',
@@ -30,22 +36,33 @@ const REVIEW_MODEL = 'opus'      // reviewers + verifiers: judgment work never o
 const FIX_MODEL = 'sonnet'
 const LANES_MODEL = 'sonnet'
 const MAX_ROUNDS = 2             // total review rounds per batch (args.round counts earlier ones)
-const LINE_WINDOW = 3            // dedup window (lines) within one file
+const SMALL_DELTA_LINES = 100    // changedLines below this -> one reviewer for all lenses
 const MAX_FINDINGS = 8
 const MAX_TRIED = 10
-const SEV_RANK = { HIGH: 3, MEDIUM: 2, LOW: 1 }
 
 // ---------------------------------------------------------------- args
 const A = args || {}
 const repo = A.repo
 const baseRange = A.range
 if (!repo || !baseRange) throw new Error('pcc-review: args.repo and args.range are required')
-const extra = Array.isArray(A.extra) ? A.extra : []
+const REV_RE = /^[\w.\/~^@{}-]+(\.\.\.?[\w.\/~^@{}-]+)?$/
+function checkRev(x, what) {
+  if (typeof x !== 'string' || !REV_RE.test(x) || x.startsWith('-')) throw new Error(`pcc-review: ${what} must be a single rev or a..b / a...b, got ${JSON.stringify(x)}`)
+}
+function parseCount(v, what) {
+  if (typeof v === 'number' && Number.isInteger(v) && v >= 0) return v
+  if (typeof v === 'string' && /^\d+$/.test(v)) return Number(v)
+  throw new Error(`pcc-review: ${what} must be a non-negative integer, got ${JSON.stringify(v)}`)
+}
+checkRev(baseRange, 'args.range')
+if (A.extra !== undefined && A.extra !== null && !Array.isArray(A.extra)) throw new Error('pcc-review: args.extra must be an array of ranges')
+const extra = (A.extra || []).slice()
+extra.forEach((x, i) => checkRev(x, `args.extra[${i}]`))
 const doFix = A.fix === true
 const doLanes = A.lanes === true
 const context = String(A.context || '').slice(0, 800)
-const startRound = (A.round === undefined || A.round === null) ? 0 : Number(A.round)
-if (!Number.isInteger(startRound) || startRound < 0) throw new Error('pcc-review: args.round must be a non-negative integer, got ' + JSON.stringify(A.round))
+const startRound = (A.round === undefined || A.round === null) ? 0 : parseCount(A.round, 'args.round')
+const changedLines = (A.changedLines === undefined || A.changedLines === null) ? null : parseCount(A.changedLines, 'args.changedLines')
 const scratchBase = A.scratch ? String(A.scratch).replace(/\/+$/, '') : ''
 const limits = A.limits ? String(A.limits) : ''
 const LIMITS_FALLBACK = `If ${repo}/.claude/pcc.md states memory/CPU limits for probes, tests or builds, follow them.`
@@ -58,32 +75,33 @@ function scratchRule(name) {
 }
 
 // ---------------------------------------------------------------- schemas
-const FINDINGS_SCHEMA = {
-  type: 'object',
-  properties: {
-    findings: {
-      type: 'array',
-      maxItems: MAX_FINDINGS,
-      items: {
-        type: 'object',
-        properties: {
-          severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
-          file: { type: 'string' },
-          line: { type: 'integer' },
-          title: { type: 'string', description: '<= 15 words' },
-          evidence: { type: 'string', description: '<= 50 words: exact input or measurement' },
-          fix: { type: 'string', description: '<= 30 words' },
+// tried is per lens: an object with one non-empty array per lens of the group
+function findingsSchema(lenses) {
+  const triedProps = {}
+  for (const l of lenses) triedProps[l] = { type: 'array', minItems: 1, maxItems: MAX_TRIED, items: { type: 'string', description: '<= 15 words: attack/check shape tried' } }
+  return {
+    type: 'object',
+    properties: {
+      findings: {
+        type: 'array',
+        maxItems: MAX_FINDINGS,
+        items: {
+          type: 'object',
+          properties: {
+            severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
+            file: { type: 'string' },
+            line: { type: 'integer' },
+            title: { type: 'string', description: '<= 15 words' },
+            evidence: { type: 'string', description: '<= 50 words: exact input or measurement' },
+            fix: { type: 'string', description: '<= 30 words' },
+          },
+          required: ['severity', 'file', 'line', 'title', 'evidence', 'fix'],
         },
-        required: ['severity', 'file', 'line', 'title', 'evidence', 'fix'],
       },
+      tried: { type: 'object', properties: triedProps, required: lenses.slice() },
     },
-    tried: {
-      type: 'array',
-      maxItems: MAX_TRIED,
-      items: { type: 'string', description: '<= 15 words: attack/check shape tried' },
-    },
-  },
-  required: ['findings', 'tried'],
+    required: ['findings', 'tried'],
+  }
 }
 
 const VERDICT_SCHEMA = {
@@ -139,10 +157,18 @@ const LENS_TEXT = {
 }
 
 // one agent per lens; measured 2026-10-15 on the same delta: merging correctness+simplify into one agent cost the same tokens overall and lost the simplify lens (the merged agent ran zero simplify checks; the separate simplify agent alone had found a dead regression test)
-const LENS_GROUPS = [['security'], ['correctness'], ['simplify']]
+// small deltas use one agent because each agent has a ~60-65k token floor (owner decision 2026-10-15)
+const SMALL = changedLines !== null && changedLines < SMALL_DELTA_LINES
+const LENS_GROUPS = SMALL ? [['security', 'correctness', 'simplify']] : [['security'], ['correctness'], ['simplify']]
+log(SMALL
+  ? `mode: one reviewer for all three lenses (changedLines=${changedLines} < ${SMALL_DELTA_LINES})`
+  : `mode: three separate reviewers (${changedLines === null ? 'changedLines not given' : `changedLines=${changedLines} >= ${SMALL_DELTA_LINES}`})`)
+const triedUsable = (x, g) => !!x && !!x.tried && typeof x.tried === 'object' &&
+  g.every(l => Array.isArray(x.tried[l]) && x.tried[l].some(t => typeof t === 'string' && t.trim() !== ''))
 
 function reviewPrompt(lenses, range, roundNo) {
-  const scope = [`git diff ${range}`].concat(extra.map(x => `git diff ${x}`)).join('   and   ')
+  const scopeRanges = [range].concat(extra)
+  const scope = scopeRanges.map(x => `git diff ${x}`).join('   and   ')
   return [
     `You are a code reviewer. Lens(es): ${lenses.map(l => LENS_TEXT[l]).join('  ')}`,
     `Repo (cd there first): ${repo}`,
@@ -154,9 +180,12 @@ function reviewPrompt(lenses, range, roundNo) {
     '- No docker, no servers, no Playwright. Never pkill/killall. Run long commands in the foreground.',
     '- Do not edit tracked files. ' + scratchRule(`pcc-review-${lenses.join('+')}-r${roundNo}`),
     '- ' + NO_EXTERNAL,
+    scopeRanges.some(x => !x.includes('..'))
+      ? 'A scope range that is a single rev (or ends at the working tree) does not show untracked new files in `git diff`: also run `git ls-files --others --exclude-standard` and review those new files as part of the delta.'
+      : '',
     'If the range is empty, invalid, or the diff shows nothing, report that as a HIGH finding (file "-", line 0): an unreadable delta is not a clean delta.',
     'Severity: HIGH = server CPU/memory DoS reachable by any user, XSS/unsafe content reaching another user, data loss, auth bypass, or a correctness bug normal users hit. MEDIUM = real but limited to the user\'s own tab or needing unusual input. LOW = cleanup.',
-    `Report short: at most ${MAX_FINDINGS} findings (title <= 15 words, evidence <= 50 words with exact input/measurement, fix <= 30 words) and always a "tried" list (<= ${MAX_TRIED} items, <= 15 words each) of the attack/check shapes you tried, even when you found nothing. An empty finding list with no "tried" entries is not accepted.`,
+    `Report short: at most ${MAX_FINDINGS} findings (title <= 15 words, evidence <= 50 words with exact input/measurement, fix <= 30 words) and always a "tried" object with one list per lens (${lenses.join(', ')}; <= ${MAX_TRIED} items, <= 15 words each) of the attack/check shapes you tried under EACH lens, even when you found nothing. An empty list for any lens is rejected.`,
   ].filter(Boolean).join('\n')
 }
 
@@ -199,19 +228,6 @@ function lanesPrompt(head) {
 }
 
 // ---------------------------------------------------------------- code helpers
-function dedup(list) {
-  const sorted = list.slice().sort((a, b) => SEV_RANK[b.severity] - SEV_RANK[a.severity])
-  const kept = []
-  let dropped = 0
-  for (const f of sorted) {
-    const dup = kept.find(k => k.lens === f.lens && k.file === f.file && Math.abs(k.line - f.line) <= LINE_WINDOW)
-    if (dup) { dropped++; continue }
-    kept.push(f)
-  }
-  if (dropped) log(`dedup: merged ${dropped} duplicate finding(s) (same lens, same file, line +-${LINE_WINDOW}, kept higher severity)`)
-  return kept
-}
-
 const tried = {}
 const debt = []
 const refutedHigh = []
@@ -237,31 +253,36 @@ while (!status) {
   roundsUsed++
 
   phase('Review')
-  const groups = LENS_GROUPS
-  const reports = await parallel(groups.map(g => () =>
-    (async () => {
-      const opts = { phase: 'Review', model: REVIEW_MODEL, schema: FINDINGS_SCHEMA }
-      let r = await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${g.join('+')}` })
-      const unusable = x => !x || !Array.isArray(x.tried) || x.tried.length === 0
-      if (unusable(r)) {
-        log(`r${roundNo}: reviewer ${g.join('+')} returned nothing or an empty tried list, retrying once`)
-        r = await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${g.join('+')}:retry` })
-      }
-      if (unusable(r)) r = null
-      return { g, r }
-    })()))
+  const reports = await parallel(LENS_GROUPS.map(g => async () => {
+    const gk = g.join('+')
+    const opts = { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g) }
+    const attempts = [await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${gk}` })]
+    if (!triedUsable(attempts[0], g)) {
+      log(`r${roundNo}: reviewer ${gk} returned nothing or unusable tried coverage, retrying once (findings of both attempts are kept)`)
+      attempts.push(await agent(reviewPrompt(g, range, roundNo), { ...opts, label: `r${roundNo}:${gk}:retry` }))
+    }
+    return { g, attempts }
+  }))
 
   const raw = []
-  for (let i = 0; i < reports.length; i++) {
-    const rep = reports[i]
-    if (!rep || !rep.r) { uncovered.push(...groups[i]); log(`r${roundNo}: lens uncovered after retry: ${groups[i].join('+')} -> final status will be blocked`); continue }
+  for (const rep of reports) {
     const gk = rep.g.join('+')
-    if (!tried[gk]) tried[gk] = []
-    tried[gk].push(...rep.r.tried.map(t => `r${roundNo}: ${t}`))
-    raw.push(...rep.r.findings.map(f => ({ ...f, lens: gk })))
+    if (!rep.attempts.some(x => triedUsable(x, rep.g))) {
+      uncovered.push(...rep.g)
+      log(`r${roundNo}: lens uncovered after retry: ${gk} -> final status will be blocked (its findings are still processed)`)
+    }
+    for (const x of rep.attempts) {
+      if (!x) continue
+      for (const l of rep.g) {
+        const list = x.tried && Array.isArray(x.tried[l]) ? x.tried[l].filter(t => typeof t === 'string' && t.trim() !== '') : []
+        if (!tried[l]) tried[l] = []
+        tried[l].push(...list.map(t => `r${roundNo}: ${t}`))
+      }
+      if (Array.isArray(x.findings)) raw.push(...x.findings.map(fd => ({ ...fd, lens: gk })))
+    }
   }
   if (!raw.length) log(`r${roundNo}: no findings from any lens`)
-  const merged = dedup(raw)
+  const merged = raw
   const highs = merged.filter(f => f.severity === 'HIGH')
   const mediums = merged.filter(f => f.severity === 'MEDIUM')
   debt.push(...merged.filter(f => f.severity === 'LOW'))
@@ -334,9 +355,6 @@ while (!status) {
   range = `${fx.base}..${fx.head}`
   extra.length = 0 // the fix delta is reviewed alone; earlier ranges were already reviewed
   log(`r${roundNo}: fixed ${actionable.length} finding(s) in ${range}; next round reviews only this delta`)
-  // the fixed findings are no longer outstanding; the next round re-finds anything that remains
-  high = []
-  medium = []
 }
 
 // ---------------------------------------------------------------- uncovered lens guard
@@ -357,8 +375,10 @@ if (status === 'ship' && doLanes) {
     schema: LANES_SCHEMA,
   })
   const laneList = lanes && Array.isArray(lanes.lanes) ? lanes.lanes : []
-  if (!lanes || lanes.verdict !== 'green' || !laneList.length || laneList.some(l => l.result === 'fail')) {
-    log('lanes: red, failed lane, empty lanes or no result -> status blocked')
+  const skippedLanes = laneList.filter(l => l.result === 'skipped').map(l => l.name)
+  if (skippedLanes.length) note = (note ? note + '; ' : '') + `lanes skipped: ${skippedLanes.join(', ')}`
+  if (!lanes || lanes.verdict !== 'green' || !laneList.length || laneList.some(l => l.result === 'fail') || !laneList.some(l => l.result === 'pass')) {
+    log('lanes: red, failed lane, empty lanes, no passing lane or no result -> status blocked')
     status = 'blocked'
   }
 } else if (doLanes) {
