@@ -24,6 +24,14 @@ If the file is missing, the skill works out the stack itself (`package.json`, `b
 <clean build>                # e.g. ./gradlew clean build
 ```
 
+## Security paths
+
+One regex line. When a delta touches none of these paths the review skips the security lens (`security: false`); no line means the lens always runs.
+
+```
+security_paths: ^(src/auth/|src/api/|migrations/|.*\.sql$)
+```
+
 ## Lanes this repo does NOT have
 
 The point of writing absence down is that it stops being rediscovered - and stops being confused with "I could not find it". One line each, with the reason.

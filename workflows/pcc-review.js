@@ -1,45 +1,50 @@
-// pcc-review - PCC review cycle for a delta. Call: Workflow({name: "pcc:pcc-review", args: {...}})
+// pcc-review v2 - ONE review per batch, a narrow fix-check of the fix diff, then a hard stop.
+// Call: Workflow({scriptPath: ".../workflows/pcc-review.js", args: {...}})
 // args:
 //   repo     (required) absolute path of the repo
 //   range    (required) the delta to review: "<base>..<head>" / "<base>...<head>", or a single rev "<base>"
 //            (a single rev = <base> against the WORKING TREE, so uncommitted edits are in the delta; run
 //            `git add -N <new files>` first, otherwise untracked files are invisible to git diff)
-//   extra?   more ranges to review in the same round (array, same forms as range)
+//   extra?   more ranges to review in the same review (array, same forms as range)
 //   changedLines? non-negative integer: sum of added+deleted lines of `git diff --numstat <range>` (new files included via `git add -N`).
-//            ONE reviewer covers security+correctness+simplify only when changedLines < 100 AND extra is empty; missing,
-//            >= 100, or any extra entry -> three separate reviewers. Round 2 uses the fixer's own changedLines for base..head.
-//   fix?     true -> one sonnet fixer commits once for the surviving HIGH+MEDIUM findings
+//            code tier: ONE reviewer covers all lenses only when changedLines < 100 AND extra is empty; missing,
+//            >= 100, or any extra entry -> separate reviewers per lens.
+//   tier?    'code' (default) | 'docs'. docs = one reviewer with lenses docs+simplify (docs, README, agent/policy text).
+//   security? boolean, default true. false drops the security lens (caller: no file of the delta matches the adapter's security_paths).
+//   fix?     true -> a sonnet fixer commits once for the surviving HIGH+MEDIUM findings, then ONE opus fix-check reads only that
+//            fix diff. Max 2 fix cycles; blockers left after cycle 2 -> 'structural'.
 //   lanes?   true -> after a ship verdict, run the repo's PCC sweep lanes per <repo>/.claude/pcc.md
-//   round?   non-negative integer: review rounds already spent on this batch (budget is 2 in total)
 //   context? short caller note for the reviewers (cut to 800 chars)
 //   scratch? base dir for agent scratch files; without it each agent makes its own with mktemp -d
 //   limits?  free text, a binding resource rule for probes/tests/builds, e.g.
 //            "probes: systemd-run --user --scope -q -p MemoryMax=3G -p MemorySwapMax=0 <cmd>; tests/builds: MemoryMax=6G"
-// After round 2 a surviving HIGH gives 'structural'; MEDIUM-only gives 'ship' with medium[] returned UNFIXED
-// (a fix after the last review would be unreviewed code).
-// returns { status: 'ship'|'blocked'|'structural', roundsUsed, head, high, medium, debt, refutedHigh,
-//           tried, lanes, note, uncovered }. tried is keyed by lens (security/correctness/simplify) in both modes. 'blocked' or a non-empty `uncovered` is not a ship.
+//   round    REMOVED in v2: passing it throws.
+// Leftover MEDIUMs (after a fix-check) go to medium[] for cards and never start another cycle.
+// returns { status: 'ship'|'blocked'|'structural', mode, fixCycles, head, high, medium, debt, refutedHigh,
+//           tried, fixChecks, lanes, note, uncovered }. tried is keyed by lens. 'blocked' or a non-empty `uncovered` is not a ship.
 
 export const meta = {
   name: 'pcc-review',
-  description: 'PCC review cycle: delta-only lens reviews, skeptic verify of HIGHs, one fixer, re-review, optional PCC lanes',
-  whenToUse: 'PCC review gate for any repo with a .claude/pcc.md; delta-only, Opus reviewers, Sonnet fixers, max 2 rounds',
+  description: 'PCC review v2: one delta-only review per batch (1-3 Opus agents by risk tier), skeptic per HIGH, sonnet fixer, Opus fix-check of the fix diff only, optional PCC lanes',
+  whenToUse: 'PCC review gate for any repo with a .claude/pcc.md; one review, max 2 fix cycles, then ship or structural',
   phases: [
-    { title: 'Review', detail: 'security | correctness | simplify on the delta only', model: 'opus' },
+    { title: 'Review', detail: 'security | correctness | simplify (or docs | simplify) on the delta only, once', model: 'opus' },
     { title: 'Verify', detail: 'one skeptic per HIGH finding, default refuted', model: 'opus' },
-    { title: 'Fix', detail: 'one fixer for all surviving HIGH+MEDIUM, one commit', model: 'sonnet' },
+    { title: 'Fix', detail: 'one fixer for all surviving HIGH+MEDIUM, one commit; structural if too big', model: 'sonnet' },
+    { title: 'Fix-check', detail: 'one reviewer reads only the fix diff: findings fixed? anything new introduced?', model: 'opus' },
     { title: 'Lanes', detail: 'repo PCC sweep per .claude/pcc.md', model: 'sonnet' },
   ],
 }
 
 // ---------------------------------------------------------------- policy
-const REVIEW_MODEL = 'opus'      // reviewers + verifiers: judgment work never on sonnet
+const REVIEW_MODEL = 'opus'      // reviewers, verifiers, fix-check: judgment work never on sonnet
 const FIX_MODEL = 'sonnet'
 const LANES_MODEL = 'sonnet'
-const MAX_ROUNDS = 2             // total review rounds per batch (args.round counts earlier ones)
 const SMALL_DELTA_LINES = 100    // changedLines below this -> one reviewer for all lenses
 const MAX_FINDINGS = 8
 const MAX_TRIED = 10
+const MAX_FIX_CYCLES = 2         // fix + fix-check cycles per batch; blockers after the last one -> structural
+const FIX_STRUCTURAL_LINES = 150 // a fix bigger than this is a redesign: the fixer must not write it
 
 // ---------------------------------------------------------------- args
 const A = args || {}
@@ -73,7 +78,11 @@ extra.forEach((x, i) => checkRev(x, `args.extra[${i}]`))
 const doFix = A.fix === true
 const doLanes = A.lanes === true
 const context = String(A.context || '').slice(0, 800)
-const startRound = (A.round === undefined || A.round === null) ? 0 : parseCount(A.round, 'args.round')
+if (A.round !== undefined) throw new Error('pcc-review v2: args.round was removed - v2 runs one review per batch; a batch that needs more is a structural decision')
+const tier = (A.tier === undefined || A.tier === null) ? 'code' : A.tier
+if (tier !== 'code' && tier !== 'docs') throw new Error(`pcc-review: args.tier must be 'code' or 'docs', got ${JSON.stringify(A.tier)}`)
+if (A.security !== undefined && A.security !== null && typeof A.security !== 'boolean') throw new Error('pcc-review: args.security must be a boolean')
+const useSecurity = A.security !== false
 const changedLines = (A.changedLines === undefined || A.changedLines === null) ? null : parseCount(A.changedLines, 'args.changedLines')
 const scratchBase = A.scratch ? String(A.scratch).replace(/\/+$/, '') : ''
 const limits = A.limits ? String(A.limits) : ''
@@ -87,6 +96,16 @@ function scratchRule(name) {
 }
 
 // ---------------------------------------------------------------- schemas
+const FINDING_PROPS = {
+  severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
+  file: { type: 'string' },
+  line: { type: 'integer' },
+  title: { type: 'string', description: '<= 15 words' },
+  evidence: { type: 'string', description: '<= 50 words: file:line and the concrete failure scenario' },
+  fix: { type: 'string', description: '<= 30 words' },
+}
+const FINDING_ITEM = { type: 'object', properties: FINDING_PROPS, required: ['severity', 'file', 'line', 'title', 'evidence', 'fix'] }
+
 // tried is per lens: an object with one non-empty array per lens of the group
 function findingsSchema(lenses) {
   const triedProps = {}
@@ -94,22 +113,7 @@ function findingsSchema(lenses) {
   return {
     type: 'object',
     properties: {
-      findings: {
-        type: 'array',
-        maxItems: MAX_FINDINGS,
-        items: {
-          type: 'object',
-          properties: {
-            severity: { type: 'string', enum: ['HIGH', 'MEDIUM', 'LOW'] },
-            file: { type: 'string' },
-            line: { type: 'integer' },
-            title: { type: 'string', description: '<= 15 words' },
-            evidence: { type: 'string', description: '<= 50 words: exact input or measurement' },
-            fix: { type: 'string', description: '<= 30 words' },
-          },
-          required: ['severity', 'file', 'line', 'title', 'evidence', 'fix'],
-        },
-      },
+      findings: { type: 'array', maxItems: MAX_FINDINGS, items: FINDING_ITEM },
       tried: { type: 'object', properties: triedProps, required: lenses.slice() },
     },
     required: ['findings', 'tried'],
@@ -128,14 +132,37 @@ const VERDICT_SCHEMA = {
 const FIX_SCHEMA = {
   type: 'object',
   properties: {
-    head: { type: 'string', description: '40-hex sha of your commit' },
-    base: { type: 'string', description: 'sha of HEAD before your commit' },
+    structural: { type: 'boolean', description: `true when the fix needs more than ~${FIX_STRUCTURAL_LINES} changed lines or a redesign: you made NO commit` },
+    reason: { type: 'string', description: 'why the fix is structural (<= 40 words)' },
+    head: { type: 'string', description: '40-hex sha of your commit (structural: the current HEAD)' },
+    base: { type: 'string', description: 'sha of HEAD before your commit (structural: the current HEAD)' },
     summary: { type: 'string', description: '<= 60 words' },
     changedLines: { type: 'integer', minimum: 0, description: 'added+deleted lines of `git diff --numstat <base>..<head>` for your commit' },
     testsRun: { type: 'array', items: { type: 'string' } },
     concerns: { type: 'array', items: { type: 'string' } },
   },
   required: ['head', 'base', 'summary', 'testsRun', 'concerns'],
+}
+
+const CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    results: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          index: { type: 'integer', description: 'number of the finding in the list you were given' },
+          fixed: { type: 'boolean' },
+          note: { type: 'string', description: '<= 20 words' },
+        },
+        required: ['index', 'fixed', 'note'],
+      },
+    },
+    newFindings: { type: 'array', maxItems: 5, items: FINDING_ITEM },
+    tried: { type: 'array', minItems: 1, maxItems: MAX_TRIED, items: { type: 'string', description: '<= 15 words: check shape tried' } },
+  },
+  required: ['results', 'newFindings', 'tried'],
 }
 
 const LANES_SCHEMA = {
@@ -167,47 +194,59 @@ const LENS_TEXT = {
     'CORRECTNESS: behaviour bugs normal users hit, data loss, wrong results, races, error paths, edge cases of the changed code, missing or wrong tests for changed behaviour.',
   simplify:
     'SIMPLIFY: needless complexity, duplicated helpers that already exist, dead code, hand-rolled code where a standard library exists. These are normally LOW unless they hide a real bug.',
+  docs:
+    'DOCS: factual accuracy against the code the text describes, contradictions, steps an agent or user could misread, missing steps; ' +
+    'for agent/policy instructions also anything that grants access or leaks data. Wording and style preferences are LOW.',
 }
 
-// one agent per lens; measured 2026-10-15 on the same delta: merging correctness+simplify into one agent cost the same tokens overall and lost the simplify lens (the merged agent ran zero simplify checks; the separate simplify agent alone had found a dead regression test)
-// three separate reviewers (one combined reviewer when changedLines < 100 and no extra): each agent has a ~60-65k token floor (owner decision 2026-10-15)
-// small mode needs a known small delta AND no extra ranges (changedLines does not cover extra)
-function groupsFor(lines, roundNo) {
+// Risk tiers (owner decision 2026-10-15): docs -> one agent; small code delta -> one agent; otherwise one agent per lens
+// (measured: each agent has a ~60-65k token floor, and a merged correctness+simplify agent lost the simplify checks).
+function groupsFor(lines) {
+  if (tier === 'docs') {
+    log('mode: docs tier -> one reviewer, lenses docs+simplify' + (useSecurity ? '' : ' (security lens off: caller passed security=false)'))
+    return { mode: 'docs', groups: [['docs', 'simplify']] }
+  }
   const small = lines !== null && lines < SMALL_DELTA_LINES && extra.length === 0
-  log(small
-    ? `r${roundNo}: mode: one reviewer for all three lenses (changedLines=${lines} < ${SMALL_DELTA_LINES}, no extra)`
-    : `r${roundNo}: mode: three separate reviewers (${extra.length ? 'extra ranges given' : lines === null ? 'changedLines not given' : `changedLines=${lines} >= ${SMALL_DELTA_LINES}`})`)
-  return small ? [['security', 'correctness', 'simplify']] : [['security'], ['correctness'], ['simplify']]
+  const why = small
+    ? `changedLines=${lines} < ${SMALL_DELTA_LINES}, no extra`
+    : extra.length ? 'extra ranges given' : lines === null ? 'changedLines not given' : `changedLines=${lines} >= ${SMALL_DELTA_LINES}`
+  const lenses = useSecurity ? ['security', 'correctness', 'simplify'] : ['correctness', 'simplify']
+  log(`mode: ${small ? 'one reviewer for ' + lenses.join('+') : 'separate reviewers per lens (' + lenses.join(', ') + ')'} (${why})` +
+    (useSecurity ? '' : '; security lens off: caller passed security=false'))
+  return { mode: small ? 'small' : 'large', groups: small ? [lenses] : lenses.map(l => [l]) }
 }
-const cleanTried = (x, l) => x && x.tried && typeof x.tried === 'object' && Array.isArray(x.tried[l])
-  ? x.tried[l].filter(t => typeof t === 'string' && t.trim() !== '') : []
+const cleanList = a => Array.isArray(a) ? a.filter(t => typeof t === 'string' && t.trim() !== '') : []
+const cleanTried = (x, l) => x && x.tried && typeof x.tried === 'object' && !Array.isArray(x.tried) ? cleanList(x.tried[l]) : []
 // usable = findings is an array (never silently treated as clean) and every lens has a non-blank tried entry
 const triedUsable = (x, g) => !!x && Array.isArray(x.findings) && g.every(l => cleanTried(x, l).length > 0)
 
-function reviewPrompt(lenses, range, roundNo) {
+function reviewPrompt(lenses, range) {
   const scopeRanges = [range].concat(extra)
-  const scope = scopeRanges.map(x => `git diff ${x}`).join('   and   ')
+  const diffCmds = scopeRanges.map(x => `git diff -U25 ${x}`).join('  and  ')
   return [
     `You are a code reviewer. Lens(es): ${lenses.map(l => LENS_TEXT[l]).join('  ')}`,
     `Repo (cd there first): ${repo}`,
-    `SCOPE: ONLY the changes shown by: ${scope}. Read surrounding code only to understand callers and invariants; do not report problems outside this delta.`,
+    `SCOPE: ONLY the changes of: ${scopeRanges.map(x => `git diff ${x}`).join('   and   ')}. Report only problems inside this delta.`,
     context ? `Context from the caller: ${context}` : '',
-    'Your job is to REFUTE the claim "this delta is safe and correct", not to confirm it. Measure instead of guessing: build a concrete input or run the code and report what you saw.',
+    'Look for REAL defects in the delta. Budget: at most 30 tool calls.',
+    `First write ${diffCmds} into ONE file in your scratch directory and Read that file whole, once. Open surrounding code only where a caller or an invariant matters.`,
+    'Do NOT build harnesses, fuzzers, corpora or benchmarks. At most ONE probe (<= 5 minutes, under the limits rule), and only to confirm a suspected HIGH.',
+    'Every finding needs file:line and a concrete failure scenario (exact input or sequence and what goes wrong). A speculative "could" is LOW at most.',
     'Rules:',
     '- ' + limitsRule,
     '- No docker, no servers, no Playwright. Never pkill/killall. Run long commands in the foreground.',
-    '- Do not edit tracked files. ' + scratchRule(`pcc-review-${lenses.join('+')}-r${roundNo}`),
+    '- Do not edit tracked files. ' + scratchRule(`pcc-review-${lenses.join('+')}`),
     '- ' + NO_EXTERNAL,
     scopeRanges.some(x => !x.includes('..'))
       ? 'A scope range that is a single rev (or ends at the working tree) does not show untracked new files in `git diff`: also run `git ls-files --others --exclude-standard` and review those new files as part of the delta.'
       : '',
     'If the range is empty, invalid, or the diff shows nothing, report that as a HIGH finding (file "-", line 0): an unreadable delta is not a clean delta.',
     'Severity: HIGH = server CPU/memory DoS reachable by any user, XSS/unsafe content reaching another user, data loss, auth bypass, or a correctness bug normal users hit. MEDIUM = real but limited to the user\'s own tab or needing unusual input. LOW = cleanup.',
-    `Report short: at most ${MAX_FINDINGS} findings (title <= 15 words, evidence <= 50 words with exact input/measurement, fix <= 30 words) and always a "tried" object with one list per lens (${lenses.join(', ')}; <= ${MAX_TRIED} items, <= 15 words each) of the attack/check shapes you tried under EACH lens, even when you found nothing. An empty list for any lens is rejected.`,
+    `Report short: at most ${MAX_FINDINGS} findings (title <= 15 words, evidence <= 50 words with file:line and the failure scenario, fix <= 30 words) and always a "tried" object with one list per lens (${lenses.join(', ')}; <= ${MAX_TRIED} items, <= 15 words each) of the checks you made under EACH lens, even when you found nothing. An empty list for any lens is rejected.`,
   ].filter(Boolean).join('\n')
 }
 
-function verifyPrompt(f, range, roundNo, idx) {
+function verifyPrompt(f, range, idx) {
   return [
     `You are a skeptic. Repo (cd there): ${repo}. Delta: git diff ${range}${extra.length ? ' (plus ' + extra.join(', ') + ')' : ''}.`,
     'A reviewer claims this HIGH finding. Try to REFUTE it: reproduce it, or show it is unreachable, bounded, already handled, or not in the delta. Refute ONLY with concrete evidence (a measurement, or a code path showing it is unreachable, bounded, already handled, or outside the delta). If you cannot show that, answer refuted=false.',
@@ -215,17 +254,20 @@ function verifyPrompt(f, range, roundNo, idx) {
     `Evidence: ${f.evidence}`,
     `Suggested fix: ${f.fix}`,
     limitsRule,
-    `No docker/servers/Playwright, never pkill/killall, no edits to tracked files. ${scratchRule(`pcc-review-verify-r${roundNo}-${idx}`)} ${NO_EXTERNAL}`,
+    `No docker/servers/Playwright, never pkill/killall, no edits to tracked files. ${scratchRule(`pcc-review-verify-${idx}`)} ${NO_EXTERNAL}`,
     'Return refuted (boolean) and reason (<= 40 words).',
   ].join('\n')
 }
 
+const numbered = items => items.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line} - ${f.title}\n   evidence: ${f.evidence}\n   suggested fix: ${f.fix}`)
+
 function fixPrompt(items) {
   return [
     `You are the fixer. Work ONLY in ${repo} on its current branch (cd there). Never touch other branches or worktrees.`,
-    'Fix every finding below (all are verified HIGH or MEDIUM). Keep each change minimal and behaviour-preserving apart from the fix.',
+    'Fix every finding below (all are verified HIGH or MEDIUM, inside the reviewed delta). Keep each change minimal and behaviour-preserving apart from the fix.',
+    `If fixing needs more than ~${FIX_STRUCTURAL_LINES} changed lines or a redesign, do not write it: make no commit and return structural=true with a reason (head and base = the current HEAD).`,
     'Findings:',
-    ...items.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line} - ${f.title}\n   evidence: ${f.evidence}\n   suggested fix: ${f.fix}`),
+    ...numbered(items),
     'Stage and commit ONLY the files you change for these findings (git add <paths>; never git add -A / commit -a); leave any other uncommitted changes in the tree untouched.',
     'Steps: record `git rev-parse HEAD` as base; make the fixes; add or adjust tests; run ONLY the touched tests; commit ONCE.',
     limitsRule,
@@ -233,6 +275,23 @@ function fixPrompt(items) {
     'Commit rules: English message with a conventional prefix (fix(scope): ...); never push, never amend, never rebase, no git checkout/restore of work files. Do not pkill/killall; no docker/servers. Run long commands in the foreground.',
     'If you decide to skip, disable, or weaken anything, or accept a risk, list it in concerns.',
     'Return head (the 40-hex sha of your commit), base (sha before it), summary (<= 60 words), changedLines (integer: added+deleted lines summed from `git diff --numstat <base>..<head>` after your commit), testsRun, concerns.',
+  ].join('\n')
+}
+
+function checkPrompt(items, base, fixHead, idx) {
+  return [
+    `You are the fix-check reviewer. Repo (cd there): ${repo}. Read ONLY \`git diff ${base}..${fixHead}\` (the fix commit) and the numbered findings below. Review nothing else.`,
+    '1. For each finding decide whether this diff really fixes it (results: index, fixed, note <= 20 words).',
+    '2. Then report defects INTRODUCED by this diff only (lines it adds or changes) as newFindings (max 5). No review of anything else.',
+    'Budget: at most 20 tool calls. At most ONE probe (<= 5 minutes, under the limits rule), and only to confirm a suspected HIGH. Every new finding needs file:line and a concrete failure scenario; a speculative "could" is LOW at most.',
+    'Findings the fixer was given:',
+    ...numbered(items),
+    'Rules:',
+    '- ' + limitsRule,
+    '- No docker, no servers, no Playwright. Never pkill/killall. Do not edit tracked files. ' + scratchRule(`pcc-review-fixcheck-${idx}`),
+    '- ' + NO_EXTERNAL,
+    'Severity: HIGH = server CPU/memory DoS reachable by any user, XSS/unsafe content reaching another user, data loss, auth bypass, or a correctness bug normal users hit. MEDIUM = real but limited to the user\'s own tab or needing unusual input. LOW = cleanup.',
+    `Return results, newFindings and a non-empty "tried" list (<= ${MAX_TRIED} items, <= 15 words each) of the checks you made, even when you found nothing.`,
   ].join('\n')
 }
 
@@ -245,150 +304,164 @@ function lanesPrompt(head) {
   ].join('\n')
 }
 
-// ---------------------------------------------------------------- code helpers
+// ---------------------------------------------------------------- state
 const tried = {}
 const debt = []
 const refutedHigh = []
+const fixChecks = []
+const uncovered = []
 let high = []
 let medium = []
-let roundsUsed = 0
+let fixCycles = 0
 let head = null
-let range = baseRange
 let status = null
 let lanes = null
 let note = null
-let roundLines = changedLines
-const uncovered = []
 
-if (startRound >= MAX_ROUNDS) {
-  log(`round budget already spent: args.round=${startRound} >= MAX_ROUNDS=${MAX_ROUNDS}; no review run, no more patching`)
-  status = 'structural'
-  note = 'round budget exhausted before this run; take a structural decision with the user'
+// a throwing agent counts as a null attempt, so the retry runs
+const guard = async (prompt, opts) => { try { return await agent(prompt, opts) } catch (e) { return null } }
+const sameKey = fd => JSON.stringify([fd.severity, fd.file, fd.line, fd.title])
+
+// ---------------------------------------------------------------- review (once)
+phase('Review')
+const { mode, groups } = groupsFor(changedLines)
+const ask = (g, label) => guard(reviewPrompt(g, baseRange), { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g), label })
+const reports = await parallel(groups.map(g => async () => {
+  const gk = g.join('+')
+  const attempts = [await ask(g, `review:${gk}`)]
+  if (!triedUsable(attempts[0], g)) {
+    log(`reviewer ${gk} returned nothing, non-array findings or unusable tried coverage, retrying once (findings of both attempts are kept)`)
+    attempts.push(await ask(g, `review:${gk}:retry`))
+  }
+  return { g, gk, attempts }
+}))
+
+const raw = []
+groups.forEach((g, i) => {
+  const rep = reports[i] || { g, gk: g.join('+'), attempts: [] } // a missing report is an uncovered group, never a crash or a ship
+  if (!rep.attempts.some(x => triedUsable(x, rep.g))) {
+    uncovered.push(...rep.g)
+    log(`lens uncovered after retry: ${rep.gk} -> final status will be blocked (its findings are still processed)`)
+  }
+  const seen = new Set() // exact duplicates (severity, file, line, title) of an earlier attempt are dropped
+  for (const x of rep.attempts) {
+    if (!x) continue
+    for (const l of rep.g) {
+      if (!tried[l]) tried[l] = []
+      tried[l].push(...cleanTried(x, l))
+    }
+    if (!Array.isArray(x.findings)) continue
+    const keys = x.findings.map(sameKey)
+    x.findings.forEach((fd, j) => { if (!seen.has(keys[j])) raw.push({ ...fd, lens: rep.gk }) })
+    keys.forEach(k => seen.add(k))
+  }
+})
+if (!raw.length) log('no findings from any lens')
+const highs = raw.filter(f => f.severity === 'HIGH')
+const mediums = raw.filter(f => f.severity === 'MEDIUM')
+debt.push(...raw.filter(f => f.severity === 'LOW'))
+
+// ---------------------------------------------------------------- verify
+phase('Verify')
+const survivors = []
+if (highs.length) {
+  const verdicts = await parallel(highs.map((f, i) => () =>
+    agent(verifyPrompt(f, baseRange, i + 1), { label: `verify${i + 1}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA })))
+  highs.forEach((f, i) => {
+    const v = verdicts[i]
+    if (v && v.refuted === true) {
+      log(`HIGH dropped as refuted - ${f.file}:${f.line} ${f.title} (${v.reason})`)
+      refutedHigh.push({ ...f, reason: v.reason })
+    } else if (!v) {
+      log(`verifier failed, HIGH kept unverified - ${f.file}:${f.line} ${f.title}`)
+      survivors.push({ ...f, unverified: true })
+    } else {
+      survivors.push(f)
+    }
+  })
+} else {
+  log('no HIGH findings, verify skipped')
 }
 
-// ---------------------------------------------------------------- main loop
+high = survivors
+medium = mediums
+let items = survivors.concat(mediums) // reviewers report in-delta only, so every MEDIUM is actionable
+
+// ---------------------------------------------------------------- fix cycles
+if (!items.length) {
+  status = 'ship'
+} else if (!doFix) {
+  log(`fix=false, not fixing ${survivors.length} HIGH / ${mediums.length} MEDIUM; returning findings`)
+  status = survivors.length ? 'blocked' : 'ship'
+}
+
+let range = baseRange
 while (!status) {
-  const roundNo = startRound + roundsUsed + 1
-  roundsUsed++
-
-  phase('Review')
-  const groups = groupsFor(roundLines, roundNo)
-  // a throwing agent counts as a null attempt, so the retry runs
-  const ask = async (g, label) => {
-    try { return await agent(reviewPrompt(g, range, roundNo), { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g), label }) } catch (e) { return null }
-  }
-  const reports = await parallel(groups.map(g => async () => {
-    const gk = g.join('+')
-    const attempts = [await ask(g, `r${roundNo}:${gk}`)]
-    if (!triedUsable(attempts[0], g)) {
-      log(`r${roundNo}: reviewer ${gk} returned nothing, non-array findings or unusable tried coverage, retrying once (findings of both attempts are kept)`)
-      attempts.push(await ask(g, `r${roundNo}:${gk}:retry`))
-    }
-    return { g, gk, attempts }
-  }))
-
-  const raw = []
-  groups.forEach((g, i) => {
-    const rep = reports[i] || { g, gk: g.join('+'), attempts: [] } // a missing report is an uncovered group, never a crash or a ship
-    if (!rep.attempts.some(x => triedUsable(x, rep.g))) {
-      uncovered.push(...rep.g)
-      log(`r${roundNo}: lens uncovered after retry: ${rep.gk} -> final status will be blocked (its findings are still processed)`)
-    }
-    const seen = new Set() // exact duplicates (severity, file, line, title) of an earlier attempt are dropped
-    for (const x of rep.attempts) {
-      if (!x) continue
-      for (const l of rep.g) {
-        if (!tried[l]) tried[l] = []
-        tried[l].push(...cleanTried(x, l).map(t => `r${roundNo}: ${t}`))
-      }
-      if (!Array.isArray(x.findings)) continue
-      const keys = x.findings.map(fd => JSON.stringify([fd.severity, fd.file, fd.line, fd.title]))
-      x.findings.forEach((fd, j) => { if (!seen.has(keys[j])) raw.push({ ...fd, lens: rep.gk }) })
-      keys.forEach(k => seen.add(k))
-    }
-  })
-  if (!raw.length) log(`r${roundNo}: no findings from any lens`)
-  const highs = raw.filter(f => f.severity === 'HIGH')
-  const mediums = raw.filter(f => f.severity === 'MEDIUM')
-  debt.push(...raw.filter(f => f.severity === 'LOW'))
-
-  phase('Verify')
-  let survivors = []
-  if (highs.length) {
-    const verdicts = await parallel(highs.map((f, i) => () =>
-      agent(verifyPrompt(f, range, roundNo, i + 1), {
-        label: `r${roundNo}:verify${i + 1}`,
-        phase: 'Verify',
-        model: REVIEW_MODEL,
-        schema: VERDICT_SCHEMA,
-      })))
-    highs.forEach((f, i) => {
-      const v = verdicts[i]
-      if (v && v.refuted === true) {
-        log(`r${roundNo}: HIGH dropped as refuted - ${f.file}:${f.line} ${f.title} (${v.reason})`)
-        refutedHigh.push({ ...f, round: roundNo, reason: v.reason })
-      } else if (!v) {
-        log(`r${roundNo}: verifier failed, HIGH kept unverified - ${f.file}:${f.line} ${f.title}`)
-        survivors.push({ ...f, unverified: true })
-      } else {
-        survivors.push(f)
-      }
-    })
-  } else {
-    log(`r${roundNo}: no HIGH findings, verify skipped`)
-  }
-
-  high = survivors
-  medium = mediums
-  const actionable = survivors.concat(mediums)
-
-  if (!actionable.length) { status = 'ship'; break }
-
-  if (!doFix) {
-    log(`r${roundNo}: fix=false, not fixing ${survivors.length} HIGH / ${mediums.length} MEDIUM; returning findings`)
-    status = survivors.length ? 'blocked' : 'ship'
-    break
-  }
-
-  if (roundNo >= MAX_ROUNDS) {
-    // A fix after the last review would ship code no review has read.
-    if (survivors.length) {
-      log(`r${roundNo}: HIGH survives the last allowed round -> structural, no more patching`)
-      status = 'structural'
-    } else {
-      log(`r${roundNo}: last round, ${mediums.length} MEDIUM left unfixed (a fix now would be unreviewed); returned in medium[]`)
-      status = 'ship'
-    }
-    break
-  }
+  fixCycles++
+  const cyc = `c${fixCycles}`
 
   phase('Fix')
-  const fx = await agent(fixPrompt(actionable), {
-    label: `r${roundNo}:fix`,
-    phase: 'Fix',
-    model: FIX_MODEL,
-    schema: FIX_SCHEMA,
-  })
+  const fx = await guard(fixPrompt(items), { label: `fix:${fixCycles}`, phase: 'Fix', model: FIX_MODEL, schema: FIX_SCHEMA })
+  if (fx && fx.structural === true) {
+    status = 'structural'
+    note = `fixer says the fix is structural: ${fx.reason || 'no reason given'}`
+    if (fx.head !== fx.base) note += ' - WARNING: the fixer committed anyway (head != base); inspect HEAD'
+    else note += ' (no commit made, HEAD == base)'
+    log(`${cyc}: ${note}`)
+    break
+  }
   if (!fx || !/^[0-9a-f]{40}$/.test(fx.head) || !/^[0-9a-f]{40}$/.test(fx.base) || fx.base === fx.head) {
-    log(`r${roundNo}: fixer failed or returned a bad/empty sha range; the fixer may have committed unreviewed code -> blocked`)
+    log(`${cyc}: fixer failed or returned a bad/empty sha range; the fixer may have committed unreviewed code -> blocked`)
     status = 'blocked'
     note = 'fixer failed or returned a bad sha range; HEAD may hold an unreviewed commit - inspect or revert HEAD before shipping'
     break
   }
-  if (fx.concerns && fx.concerns.length) log(`r${roundNo}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)
+  if (fx.concerns && fx.concerns.length) log(`${cyc}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)
   head = fx.head
-  roundLines = Number.isInteger(fx.changedLines) && fx.changedLines >= 0 ? fx.changedLines : null
   range = `${fx.base}..${fx.head}`
-  extra.length = 0 // the fix delta is reviewed alone; earlier ranges were already reviewed
-  log(`r${roundNo}: fixed ${actionable.length} finding(s) in ${range}; next round reviews only this delta`)
+  log(`${cyc}: fixed ${items.length} finding(s) in ${range}; fix-check reads only this diff`)
+
+  phase('Fix-check')
+  const usable = x => !!x && Array.isArray(x.results) && Array.isArray(x.newFindings) && cleanList(x.tried).length > 0 &&
+    x.results.every(r => r && Number.isInteger(r.index) && typeof r.fixed === 'boolean')
+  let chk = await guard(checkPrompt(items, fx.base, fx.head, fixCycles), { label: `fixcheck:${fixCycles}`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+  if (!usable(chk)) {
+    log(`${cyc}: fix-check returned nothing or an unusable result, retrying once`)
+    chk = await guard(checkPrompt(items, fx.base, fx.head, fixCycles), { label: `fixcheck:${fixCycles}:retry`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+  }
+  if (!usable(chk)) {
+    uncovered.push('fix-check')
+    status = 'blocked'
+    note = `fix-check unusable twice for ${range}; the fix commit is unreviewed`
+    log(`${cyc}: ${note}`)
+    break
+  }
+  const isFixed = i => chk.results.some(r => r.index === i + 1 && r.fixed === true)
+  const open = items.filter((f, i) => !isFixed(i))
+  const newF = chk.newFindings
+  fixChecks.push({ cycle: fixCycles, base: fx.base, head: fx.head, results: chk.results, newFindings: newF, tried: cleanList(chk.tried) })
+  debt.push(...newF.filter(f => f.severity === 'LOW'))
+  const blockers = open.filter(f => f.severity === 'HIGH').concat(newF.filter(f => f.severity === 'HIGH'))
+  medium = open.filter(f => f.severity === 'MEDIUM').concat(newF.filter(f => f.severity === 'MEDIUM')) // for cards; never opens a cycle alone
+  high = blockers
+  log(`${cyc}: fix-check: ${items.length - open.length}/${items.length} fixed, ${blockers.length} blocker(s), ${medium.length} leftover MEDIUM`)
+
+  if (!blockers.length) { status = 'ship'; break }
+  if (fixCycles >= MAX_FIX_CYCLES) {
+    status = 'structural'
+    note = `${blockers.length} HIGH still open after fix cycle ${fixCycles}: stop patching, take a structural decision with the owner`
+    log(`${cyc}: ${note}`)
+    break
+  }
+  items = blockers.concat(medium)
 }
 
 // ---------------------------------------------------------------- uncovered lens guard
 if (uncovered.length && status !== 'structural') {
   const u = Array.from(new Set(uncovered)).join(', ')
-  log(`status forced to blocked: lens uncovered: ${u}`)
+  log(`status forced to blocked: uncovered: ${u}`)
   status = 'blocked'
-  note = (note ? note + '; ' : '') + `lens uncovered: ${u}`
+  note = (note ? note + '; ' : '') + `uncovered: ${u}`
 }
 
 // ---------------------------------------------------------------- lanes
@@ -411,4 +484,4 @@ if (status === 'ship' && doLanes) {
   log(`lanes skipped: final status is ${status}, not ship`)
 }
 
-return { status, roundsUsed, head, high, medium, debt, refutedHigh, tried, lanes, note, uncovered }
+return { status, mode, fixCycles, head, high, medium, debt, refutedHigh, tried, fixChecks, lanes, note, uncovered }

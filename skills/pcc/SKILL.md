@@ -37,7 +37,7 @@ cat .claude/pcc.md 2>/dev/null || echo "NO ADAPTER"
 1. **Read the scope** - `git diff --name-only <clean-point>...HEAD`.
 2. **Build + rerun** - compile/typecheck/lint, then actually start the services and check them live. "It compiled" is not "it runs". A repo with nothing to start (a library, a CLI) skips the live check and says so.
 3. **Fix** - everything found, in **one batch**.
-4. **Review** - `Workflow({name: "pcc:pcc-review", args: {repo, range: "<base>..<head>", changedLines, fix, lanes, context, limits}})`: three Opus reviewers (security, correctness, simplify) on the range only (ONE reviewer covering all three lenses only when `changedLines` < 100 and `extra` is empty), an Opus skeptic per HIGH (refutes only with concrete evidence), one sonnet fixer that commits once when `fix: true`, at most 2 rounds. After round 2 a surviving HIGH gives `structural`; MEDIUM-only gives `ship` with `medium[]` returned unfixed. The delta must include uncommitted step-3 fixes (PCC does not commit): either pass `range` as a single rev `<base>` (diff against the working tree) or add `extra: ["HEAD"]` for the uncommitted part. Run `git add -N <new files>` first (intent-to-add) so `git diff` shows untracked new files, and pass `changedLines` = the sum of added+deleted lines from `git diff --numstat <range>` (new files included via `git add -N`); small mode is off whenever `extra` is given. `range` and each `extra` entry must be a single rev or `a..b` / `a...b` (no spaces, no shell brace expansion; braces only as `@{u}`). With `fix: true` the fixer stages only its own files. Read the returned object: `blocked` or a non-empty `uncovered` is not a ship. Where the Workflow tool is unavailable (other agents/CLIs), apply the same policy by hand: three separate reviewers (one combined reviewer when changedLines < 100 and no extra), a skeptic per HIGH, one fix batch, two rounds at most.
+4. **Review** - ONE review per batch: `Workflow({name: "pcc:pcc-review", args: {repo, range: "<base>..<head>", changedLines, security, tier, fix, lanes, context, limits}})`. An Opus skeptic refutes each HIGH only with concrete evidence; with `fix: true` one sonnet fixer commits once, then ONE Opus fix-check reads only that fix diff (were the findings fixed? did the diff introduce anything?). Max 2 fix cycles; blockers left after cycle 2, or a fixer that reports the fix as structural, give `structural`: stop patching and decide with the owner. Leftover MEDIUMs go to `medium[]` for cards and never open another review. The delta must include uncommitted step-3 fixes (PCC does not commit): pass `range` as a single rev `<base>` (diff against the working tree) or add `extra: ["HEAD"]` for the uncommitted part. Run `git add -N <new files>` first so `git diff` shows untracked new files, and pass `changedLines` = added+deleted lines from `git diff --numstat <range>`. `range` and each `extra` entry must be a single rev or `a..b` / `a...b` (no spaces, no shell brace expansion; braces only as `@{u}`). Read the returned object: `blocked` or a non-empty `uncovered` is not a ship. `args.round` no longer exists (it throws). Where the Workflow tool is unavailable, apply the same policy by hand: one review, a skeptic per HIGH, one fix batch, a fix-check of the fix diff, two cycles at most.
 5. **Tests** - every lane this repo has: full suite, integration, e2e. Name the ones it does not have.
 6. **Final clean build** - with `clean`, because an incremental build can go green off a cache.
 
@@ -99,6 +99,8 @@ Running the full suite on an intermediate iteration is a cost that proves nothin
 | backend / integration | name filter (`--tests "*Foo*"` or equivalent) | full suite |
 | e2e | ONE spec → then its group | full suite - **never** in an intermediate loop |
 
+After a fix, run only the touched packages' tests and the touched e2e specs. The full e2e suite runs once, right before ship.
+
 🔴 **A second `verify` after a red one IS an intermediate iteration.** This is the hole the table
 above does not close, and it is the single largest cost measured on a real sweep. The final pass is
 final only while it is passing; the moment it goes red and you fix something, the re-run is a loop
@@ -152,24 +154,28 @@ Put the probe in the step that brings services up, next to the health checks tha
 and name the dependency in the failure - "the tile server is down" is a different sentence from
 "four map tests failed", and only one of them sends you to the right place.
 
-## Give the review skills only the CURRENT round's delta
+## One review per batch, then a narrow fix-check
 
-When a sweep runs long, do not make the skills re-read the whole scope every round. Measured: a seven-round sweep re-read the same 550 KB diff each time, ~800k tokens and 20+ minutes per round, and nearly everything found sat in parts already reviewed in earlier rounds.
+Measured: fix rounds that each re-opened a full 3-lens review ran 1-2 days and 25-88M tokens, because a fresh adversarial reviewer always finds something new, and fixers create new findings. So:
 
-- At the start of a round, take the files that round touched with `git diff --name-only`, list them file by file in the skill argument, and write: **"SCOPE IS THESE N FILES ONLY - do NOT read the wider diff"**.
-- Pass findings already applied or deliberately deferred as a **"DO NOT re-report"** list.
-- For a comment/docs-only fix, do not restart a full PCC.
+- **One review per batch**, on the delta only (a fix commit is never re-reviewed in full). Give reviewers the file list and "SCOPE IS THESE N FILES ONLY - do NOT read the wider diff", and a "DO NOT re-report" list of what is already applied or deferred.
+- **Fix-check, not re-review:** after a fix, one agent reads only `git diff <base>..<head>` of the fix plus the numbered findings: is each fixed, and did this diff introduce a defect?
+- **Max 2 fix cycles.** HIGH still open after cycle 2 -> `structural`: stop patching, look for a structural solution, ask the owner.
+- A cosmetic finding (wrong comment, unused return value, test helper) never restarts anything: it goes to debt.
+- Docs-only fix: do not restart a full PCC.
 
-## A cosmetic finding does NOT restart the loop
+**Reviewer budget:** one `git diff -U25` read into a file, at most 30 tool calls, no harnesses, fuzzers, corpora or benchmarks, one probe only to confirm a suspected HIGH. Every finding has `file:line` and a concrete failure scenario; a speculative "could" is LOW.
 
-The loop usually repeats for mechanical reasons, not substantive ones: fix one comment line, the tree changes, the earlier steps' evidence goes stale, everything re-runs.
+**Risk tiers:**
 
-Before applying a finding, ask: **does it change behaviour?**
+| Delta | Reviewers |
+|---|---|
+| docs / agent or policy text (`tier: "docs"`) | one agent: docs + simplify |
+| code, < 100 changed lines, no `extra` | one agent: security + correctness + simplify |
+| code, >= 100 lines, touches the adapter's `security_paths` | three agents |
+| code, >= 100 lines, otherwise | two agents (correctness, simplify; `security: false`) |
 
-- **Yes** → fix it, but batch all of them together.
-- **No** (a wrong comment, an unused return value, a test helper) → write it to the debt list and CLOSE the loop.
-
-Declare one round in which nothing found is applied and everything goes to debt. Otherwise every fix spawns another round. This does not contradict "fix everything found" - the debt is recorded, not dropped.
+Adapters declare `security_paths:` as one regex line. The caller computes `security` with `git diff --name-only <range> | grep -Eq '<regex>'`; no `security_paths` line -> `security: true`.
 
 ## Reuse an expensive step only when its inputs are byte-identical
 
@@ -196,9 +202,12 @@ Measured on one repo: the sweep was ~25 minutes, 21 of them e2e. After this, a c
 - **A failed command must THROW, never return empty.** `res.stdout ?? ""` over a failed `git` yields an empty file list, and an empty list hashes to a perfectly STABLE value. The first failure is harmless - it does not match the recorded hash, so everything runs. The SECOND consecutive failure matches the first exactly, and every expensive step is reused over a tree nobody read. Guard the success of the command, and guard the empty result separately: a command can exit 0 and still say nothing.
 - **`git ls-files` QUOTES non-ASCII paths** - `core.quotePath` defaults to true, so `src/lib/tələ.ts` arrives as `"src/lib/t\311\231l\311\231.ts"`. That string names no file, so it hashes as deleted and every future edit to that file is invisible to the gate covering it. Use `-z`. A repo with zero such paths today is exactly the repo where this ships unnoticed.
 
-## Fix-everything policy
+## Severity gate
 
-Everything PCC finds gets fixed - including problems in files you did not touch and issues left by older commits. Errors and warnings alike. The final pass runs lint over the **whole tree**, not just changed files (a `tail` truncation once hid extra warnings). The only exception is the cosmetic rule above.
+- **HIGH** is fixed now and blocks the ship.
+- **MEDIUM inside the delta** is fixed in the same fix commit and never opens a new review.
+- **MEDIUM outside the delta, LOW and nits** become tracker cards / debt and are NOT fixed in this run.
+- The **mechanical gates** (lint, typecheck, tests) stay fix-everything: they are cheap and unambiguous. The final pass runs lint over the **whole tree** (a `tail` truncation once hid extra warnings).
 
 ## Evidence rules
 
@@ -235,8 +244,9 @@ The sequence is in `troubleshooting.md`. Project-specific traps are in the adapt
 ## The report
 
 1. **Verdict** - GREEN / RED, with the numbers taken from the artifacts.
-2. **How many rounds, and what each one fixed** - with file names.
+2. **Review mode, fix cycles, and what each fixed** - with file names.
 3. **What went to debt** - wherever debt is tracked, with its identifiers.
 4. **Say plainly if any step was unverified, skipped, or absent from this repo** - the word "GREEN" alone hides all three.
 5. **What needs restarting** - with full commands. If nothing does, say so explicitly.
-6. **A draft commit message** - but do NOT commit.
+6. **The cost line** from `python3 -I scripts/pcc-cost.py --project-dir ~/.claude/projects/<key> --since <batch start>`: agents, tokens, wall time for the batch. Target for a 10-15 file delta: <= 600k tokens and <= 2 h. Above 2x, stop and tell the owner.
+7. **A draft commit message** - but do NOT commit.

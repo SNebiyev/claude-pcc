@@ -34,25 +34,25 @@ function run(args, handler) {
 const A = { repo: '/x', range: 'a..b' }
 const clean = () => ({ findings: [] })
 const f = (severity, file, line, title) => ({ severity, file, line, title, evidence: 'e', fix: 'f' })
-const reviews = calls => calls.filter(c => /^r\d+:[a-z+]+(:retry)?$/.test(c))
+const reviews = calls => calls.filter(c => /^review:[a-z+]+(:retry)?$/.test(c))
 
 test('fixer short sha -> blocked', async () => {
-  const { r } = await run({ ...A, fix: true }, l => l.includes(':fix') ? { head: 'abc1234', base: H40('a'), summary: '', testsRun: [], concerns: [] }
-    : l.startsWith('r1:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
+  const { r } = await run({ ...A, fix: true }, l => l.startsWith('fix:') ? { head: 'abc1234', base: H40('a'), summary: '', testsRun: [], concerns: [] }
+    : l.startsWith('review:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
   assert.equal(r.status, 'blocked')
   assert.match(r.note, /HEAD/)
 })
 
 test('fixer base == head -> blocked', async () => {
-  const { r } = await run({ ...A, fix: true }, l => l.includes(':fix') ? { head: H40('a'), base: H40('a'), summary: '', testsRun: [], concerns: [] }
-    : l.startsWith('r1:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
+  const { r } = await run({ ...A, fix: true }, l => l.startsWith('fix:') ? { head: H40('a'), base: H40('a'), summary: '', testsRun: [], concerns: [] }
+    : l.startsWith('review:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
   assert.equal(r.status, 'blocked')
 })
 
 test('refuted HIGH does not hide a distinct HIGH from another lens', async () => {
   const { r } = await run(A, l => {
-    if (l.startsWith('r1:security')) return { findings: [f('HIGH', 'a.js', 10, 'xss')] }
-    if (l.startsWith('r1:correctness')) return { findings: [f('HIGH', 'a.js', 12, 'data loss')] }
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'a.js', 10, 'xss')] }
+    if (l.startsWith('review:correctness')) return { findings: [f('HIGH', 'a.js', 12, 'data loss')] }
     if (l.includes('verify1')) return { refuted: true, reason: 'r' }
     if (l.includes('verify2')) return { refuted: false, reason: 'r' }
     return clean()
@@ -63,12 +63,12 @@ test('refuted HIGH does not hide a distinct HIGH from another lens', async () =>
 
 test('BUG dedup: refuted HIGH does not erase a distinct HIGH 2 lines away in the same lens', async () => {
   const { r, calls } = await run(A, l => {
-    if (l === 'r1:security') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 12, 'authz bypass')] }
+    if (l === 'review:security') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 12, 'authz bypass')] }
     if (l.includes('verify1')) return { refuted: true, reason: 'r' }
     if (l.includes('verify2')) return { refuted: false, reason: 'r' }
     return clean()
   })
-  assert.equal(calls.filter(c => c.includes(':verify')).length, 2)
+  assert.equal(calls.filter(c => c.includes('verify')).length, 2)
   assert.equal(r.high.length, 1)
   assert.equal(r.high[0].title, 'authz bypass')
   assert.notEqual(r.status, 'ship')
@@ -76,12 +76,12 @@ test('BUG dedup: refuted HIGH does not erase a distinct HIGH 2 lines away in the
 
 test('BUG retry: attempt-1 HIGH with empty tried + clean retry keeps and verifies the HIGH', async () => {
   const { r, calls } = await run(A, l => {
-    if (l === 'r1:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
+    if (l === 'review:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
     if (l.includes('verify')) return { refuted: false, reason: 'r' }
     return clean()
   })
-  assert.ok(calls.includes('r1:security:retry'))
-  assert.ok(calls.includes('r1:verify1'))
+  assert.ok(calls.includes('review:security:retry'))
+  assert.ok(calls.includes('verify1'))
   assert.equal(r.high.length, 1)
   assert.notEqual(r.status, 'ship')
   assert.deepEqual(r.uncovered, [])
@@ -89,7 +89,7 @@ test('BUG retry: attempt-1 HIGH with empty tried + clean retry keeps and verifie
 
 test('BUG retry: both attempts unusable -> lens uncovered, blocked, findings still kept', async () => {
   const { r } = await run(A, l => {
-    if (l.startsWith('r1:security')) return { findings: [f('MEDIUM', 'a.js', 10, l.endsWith(':retry') ? 'm2' : 'm1')], tried: { security: [] } }
+    if (l.startsWith('review:security')) return { findings: [f('MEDIUM', 'a.js', 10, l.endsWith(':retry') ? 'm2' : 'm1')], tried: { security: [] } }
     return clean()
   })
   assert.equal(r.status, 'blocked')
@@ -99,8 +99,8 @@ test('BUG retry: both attempts unusable -> lens uncovered, blocked, findings sti
 
 test('retry findings of both attempts are merged', async () => {
   const { r } = await run(A, l => {
-    if (l === 'r1:simplify') return { findings: [f('LOW', 'a.js', 1, 'l1')], tried: { simplify: [] } }
-    if (l === 'r1:simplify:retry') return { findings: [f('LOW', 'b.js', 2, 'l2')] }
+    if (l === 'review:simplify') return { findings: [f('LOW', 'a.js', 1, 'l1')], tried: { simplify: [] } }
+    if (l === 'review:simplify:retry') return { findings: [f('LOW', 'b.js', 2, 'l2')] }
     return clean()
   })
   assert.equal(r.debt.length, 2)
@@ -114,37 +114,37 @@ test('empty tried on every lens -> uncovered, blocked', async () => {
 })
 
 test('BUG blank tried entries are unusable and filtered out', async () => {
-  const { r } = await run(A, l => l.startsWith('r1:security') ? { findings: [], tried: { security: ['', '   '] } } : clean())
+  const { r } = await run(A, l => l.startsWith('review:security') ? { findings: [], tried: { security: ['', '   '] } } : clean())
   assert.deepEqual(r.uncovered, ['security'])
   assert.equal(r.status, 'blocked')
-  const ok = await run(A, l => l.startsWith('r1:security') ? { findings: [], tried: { security: ['', 'real'] } } : clean())
+  const ok = await run(A, l => l.startsWith('review:security') ? { findings: [], tried: { security: ['', 'real'] } } : clean())
   assert.equal(ok.r.status, 'ship')
-  assert.deepEqual(ok.r.tried.security, ['r1: real'])
+  assert.deepEqual(ok.r.tried.security, ['real'])
 })
 
-test('three separate mode: tried keyed by single lens with round prefix; missing or >=100 changedLines', async () => {
+test('three separate mode: tried keyed by single lens; missing or >=100 changedLines', async () => {
   for (const cl of [undefined, 150, 100, '100']) {
     const { r, calls } = await run({ ...A, changedLines: cl }, clean)
-    assert.deepEqual(reviews(calls).sort(), ['r1:correctness', 'r1:security', 'r1:simplify'])
+    assert.deepEqual(reviews(calls).sort(), ['review:correctness', 'review:security', 'review:simplify'])
     assert.deepEqual(Object.keys(r.tried).sort(), ['correctness', 'security', 'simplify'])
-    assert.deepEqual(r.tried.security, ['r1: t'])
+    assert.deepEqual(r.tried.security, ['t'])
   }
 })
 
 test('BUG small delta: changedLines=50 -> one reviewer for all three lenses', async () => {
   const { r, calls, prompts } = await run({ ...A, changedLines: 50 }, clean)
-  assert.deepEqual(reviews(calls), ['r1:security+correctness+simplify'])
+  assert.deepEqual(reviews(calls), ['review:security+correctness+simplify'])
   assert.deepEqual(Object.keys(r.tried).sort(), ['correctness', 'security', 'simplify'])
-  assert.deepEqual(r.tried.correctness, ['r1: t'])
-  assert.match(prompts['r1:security+correctness+simplify'], /EACH lens/)
+  assert.deepEqual(r.tried.correctness, ['t'])
+  assert.match(prompts['review:security+correctness+simplify'], /EACH lens/)
   assert.equal(r.status, 'ship')
   const z = await run({ ...A, changedLines: '0' }, clean)
   assert.equal(reviews(z.calls).length, 1)
 })
 
 test('BUG small delta: merged agent with one lens tried empty -> retry, then uncovered', async () => {
-  const a = await run({ ...A, changedLines: 50 }, l => l === 'r1:security+correctness+simplify' ? { findings: [], tried: { simplify: [] } } : clean())
-  assert.deepEqual(reviews(a.calls), ['r1:security+correctness+simplify', 'r1:security+correctness+simplify:retry'])
+  const a = await run({ ...A, changedLines: 50 }, l => l === 'review:security+correctness+simplify' ? { findings: [], tried: { simplify: [] } } : clean())
+  assert.deepEqual(reviews(a.calls), ['review:security+correctness+simplify', 'review:security+correctness+simplify:retry'])
   assert.equal(a.r.status, 'ship')
   const b = await run({ ...A, changedLines: 50 }, () => ({ findings: [f('LOW', 'a.js', 1, 'l')], tried: { simplify: [] } }))
   assert.equal(b.r.status, 'blocked')
@@ -155,25 +155,18 @@ test('BUG small delta: merged agent with one lens tried empty -> retry, then unc
 
 test('untracked-file instruction only for a single-rev range', async () => {
   const one = await run({ ...A, range: 'main' }, clean)
-  assert.match(one.prompts['r1:security'], /git ls-files --others --exclude-standard/)
+  assert.match(one.prompts['review:security'], /git ls-files --others --exclude-standard/)
   const two = await run(A, clean)
-  assert.doesNotMatch(two.prompts['r1:security'], /ls-files/)
+  assert.doesNotMatch(two.prompts['review:security'], /ls-files/)
 })
 
-test('BUG strict args: bad range / extra / round / changedLines throw', async () => {
+test('BUG strict args: bad range / extra / changedLines / tier / security throw', async () => {
   for (const range of ['a b', '--output=x', 'a;b', '', 5, '$(x)']) await assert.rejects(run({ ...A, range }, clean), /range|required/, `range ${JSON.stringify(range)}`)
   for (const extra of [['a b'], [5], 'HEAD', ['ok', '-x']]) await assert.rejects(run({ ...A, extra }, clean), /extra/, `extra ${JSON.stringify(extra)}`)
-  for (const round of [true, false, [1], '', ' 1 ', '0x1', -3, 'x', 1.5, {}]) await assert.rejects(run({ ...A, round }, clean), /round/, `round ${JSON.stringify(round)}`)
+  for (const tier of ['x', 'doc', 5, true]) await assert.rejects(run({ ...A, tier }, clean), /tier/, `tier ${JSON.stringify(tier)}`)
+  for (const security of ['no', 0, 1, []]) await assert.rejects(run({ ...A, security }, clean), /security/, `security ${JSON.stringify(security)}`)
   for (const changedLines of [-1, '1.5', true, 'x', 1.5, '', [5], ' 5']) await assert.rejects(run({ ...A, changedLines }, clean), /changedLines/, `changedLines ${JSON.stringify(changedLines)}`)
   for (const range of ['main', 'a..b', 'a...b', 'HEAD~2', 'origin/main..HEAD', 'HEAD@{1}', 'v1.2.3^']) await run({ ...A, range }, clean)
-})
-
-test('round arg validated', async () => {
-  const { r, calls } = await run({ ...A, round: '2' }, clean)
-  assert.equal(r.status, 'structural')
-  assert.equal(calls.length, 0)
-  const z = await run({ ...A, round: 0 }, clean)
-  assert.equal(z.r.status, 'ship')
 })
 
 test('failed lane or empty lanes -> blocked', async () => {
@@ -200,14 +193,14 @@ test('BUG lanes: one pass + one skipped -> ship, note lists the skipped lane', a
 const FULL = ['security', 'correctness', 'simplify']
 
 test('ITEM1 reviewer throws -> retry runs and covers the lens', async () => {
-  const { r, calls } = await run(A, l => { if (l === 'r1:security') throw new Error('boom'); return clean() })
-  assert.ok(calls.includes('r1:security:retry'))
+  const { r, calls } = await run(A, l => { if (l === 'review:security') throw new Error('boom'); return clean() })
+  assert.ok(calls.includes('review:security:retry'))
   assert.equal(r.status, 'ship')
   assert.deepEqual(r.uncovered, [])
 })
 
 test('ITEM1 reviewer throws twice -> uncovered, blocked, no crash', async () => {
-  const { r } = await run(A, l => { if (l.startsWith('r1:security')) throw new Error('boom'); return clean() })
+  const { r } = await run(A, l => { if (l.startsWith('review:security')) throw new Error('boom'); return clean() })
   assert.equal(r.status, 'blocked')
   assert.deepEqual(r.uncovered, ['security'])
   const all = await run({ ...A, changedLines: 5 }, () => { throw new Error('boom') })
@@ -217,18 +210,18 @@ test('ITEM1 reviewer throws twice -> uncovered, blocked, no crash', async () => 
 
 test('ITEM2 non-array findings with usable tried are unusable -> retry -> uncovered, blocked', async () => {
   for (const bad of [null, 'none', {}]) {
-    const { r, calls } = await run(A, l => l.startsWith('r1:security') ? { raw: { findings: bad, tried: { security: ['x'] } } } : clean())
-    assert.ok(calls.includes('r1:security:retry'), JSON.stringify(bad))
+    const { r, calls } = await run(A, l => l.startsWith('review:security') ? { raw: { findings: bad, tried: { security: ['x'] } } } : clean())
+    assert.ok(calls.includes('review:security:retry'), JSON.stringify(bad))
     assert.equal(r.status, 'blocked', JSON.stringify(bad))
     assert.deepEqual(r.uncovered, ['security'])
   }
-  const ok = await run(A, l => l === 'r1:security' ? { raw: { findings: null, tried: { security: ['x'] } } } : clean())
+  const ok = await run(A, l => l === 'review:security' ? { raw: { findings: null, tried: { security: ['x'] } } } : clean())
   assert.equal(ok.r.status, 'ship') // a usable retry covers the lens
 })
 
 test('ITEM3 small mode is off whenever extra is given', async () => {
   const { calls } = await run({ ...A, changedLines: 10, extra: ['HEAD'] }, clean)
-  assert.deepEqual(reviews(calls).sort(), ['r1:correctness', 'r1:security', 'r1:simplify'])
+  assert.deepEqual(reviews(calls).sort(), ['review:correctness', 'review:security', 'review:simplify'])
   const one = await run({ ...A, changedLines: 10, extra: [] }, clean)
   assert.equal(reviews(one.calls).length, 1)
 })
@@ -246,25 +239,14 @@ test('ITEM4 rev validity table', async () => {
   }
 })
 
-test('ITEM5 round 2 mode follows the fixer changedLines', async () => {
-  const base = l => l === 'r1:correctness' ? { findings: [f('MEDIUM', 'a.js', 1, 'm')] } : clean()
-  const fixer = cl => ({ head: H40('b'), base: H40('a'), summary: '', testsRun: [], concerns: [], ...(cl === undefined ? {} : { changedLines: cl }) })
-  const small = await run({ ...A, fix: true, changedLines: 500 }, l => l.includes(':fix') ? fixer(20) : base(l))
-  assert.deepEqual(reviews(small.calls).filter(c => c.startsWith('r2')), ['r2:security+correctness+simplify'])
-  for (const cl of [undefined, 150, -1, '20', 1.5]) {
-    const big = await run({ ...A, fix: true, changedLines: 500 }, l => l.includes(':fix') ? fixer(cl) : base(l))
-    assert.deepEqual(reviews(big.calls).filter(c => c.startsWith('r2')).sort(), ['r2:correctness', 'r2:security', 'r2:simplify'], String(cl))
-  }
-})
-
 test('ITEM6 exact duplicate across attempts is dropped; near-duplicates are kept', async () => {
   const { r, calls } = await run(A, l => {
-    if (l === 'r1:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
-    if (l === 'r1:security:retry') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 11, 'xss')] }
+    if (l === 'review:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
+    if (l === 'review:security:retry') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 11, 'xss')] }
     if (l.includes('verify')) return { refuted: false, reason: 'r' }
     return clean()
   })
-  assert.equal(calls.filter(c => c.includes(':verify')).length, 2)
+  assert.equal(calls.filter(c => c.includes('verify')).length, 2)
   assert.equal(r.high.length, 2)
 })
 
@@ -273,4 +255,168 @@ test('ITEM10 small mode: tried missing a lens key -> retry -> uncovered, blocked
   assert.equal(reviews(calls).length, 2)
   assert.equal(r.status, 'blocked')
   assert.deepEqual(r.uncovered.sort(), FULL.slice().sort())
+})
+
+// ---------------------------------------------------------------- v2
+const FX = (over = {}) => ({ head: H40('b'), base: H40('a'), summary: '', testsRun: [], concerns: [], ...over })
+const chk = (results, newFindings = [], tried = ['t']) => ({ raw: { results, newFindings, tried } })
+const ok = i => ({ index: i, fixed: true, note: 'n' })
+const notOk = i => ({ index: i, fixed: false, note: 'n' })
+const mkHigh = l => l === 'review:correctness' ? { findings: [f('HIGH', 'a.js', 1, 'h')] } : l.startsWith('verify') ? { refuted: false, reason: 'r' } : clean()
+
+test('v2 args.round throws with the removal message', async () => {
+  for (const round of [0, 1, '2'])
+    await assert.rejects(run({ ...A, round }, clean), /args\.round was removed/)
+})
+
+test('v2 tier docs -> one docs+simplify agent', async () => {
+  const { r, calls, prompts } = await run({ ...A, tier: 'docs', changedLines: 500 }, clean)
+  assert.deepEqual(reviews(calls), ['review:docs+simplify'])
+  assert.equal(r.mode, 'docs')
+  assert.deepEqual(Object.keys(r.tried).sort(), ['docs', 'simplify'])
+  assert.match(prompts['review:docs+simplify'], /DOCS: factual accuracy/)
+  assert.equal(r.status, 'ship')
+})
+
+test('v2 security=false: small -> correctness+simplify; large -> two agents', async () => {
+  const s = await run({ ...A, security: false, changedLines: 10 }, clean)
+  assert.deepEqual(reviews(s.calls), ['review:correctness+simplify'])
+  assert.equal(s.r.mode, 'small')
+  const l = await run({ ...A, security: false, changedLines: 400 }, clean)
+  assert.deepEqual(reviews(l.calls).sort(), ['review:correctness', 'review:simplify'])
+  assert.equal(l.r.mode, 'large')
+  assert.deepEqual(Object.keys(l.r.tried).sort(), ['correctness', 'simplify'])
+  const t = await run({ ...A, security: true, changedLines: 10 }, clean)
+  assert.deepEqual(reviews(t.calls), ['review:security+correctness+simplify'])
+})
+
+test('v2 reviewer prompt carries the budget', async () => {
+  const { prompts } = await run(A, clean)
+  const p = prompts['review:security']
+  assert.match(p, /at most 30 tool calls/)
+  assert.match(p, /git diff -U25 a\.\.b/)
+  assert.match(p, /Do NOT build harnesses, fuzzers/)
+  assert.match(p, /ONE probe/)
+})
+
+test('v2 clean review -> ship, no fixer, no fix-check', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, clean)
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 0)
+  assert.ok(!calls.some(c => c.startsWith('fix')))
+})
+
+test('v2 HIGH fixed and fix-check clean -> ship after one cycle', async () => {
+  const { r, calls, prompts } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fixcheck:1') return chk([ok(1)])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 1)
+  assert.equal(r.head, H40('b'))
+  assert.deepEqual(r.high, [])
+  assert.equal(calls.filter(c => c.startsWith('review:')).length, 3) // no second review
+  assert.match(prompts['fixcheck:1'], new RegExp(`git diff ${H40('a')}\\.\\.${H40('b')}`))
+  assert.equal(r.fixChecks.length, 1)
+})
+
+test('v2 fix-check: HIGH unfixed -> second cycle -> clean -> ship', async () => {
+  const { r, calls, prompts } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fix:2') return FX({ head: H40('c'), base: H40('b') })
+    if (l === 'fixcheck:1') return chk([notOk(1)])
+    if (l === 'fixcheck:2') return chk([ok(1)])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 2)
+  assert.equal(r.head, H40('c'))
+  assert.match(prompts['fix:2'], /\[HIGH\] a\.js:1 - h/)
+  assert.equal(calls.filter(c => c.startsWith('review:')).length, 3)
+})
+
+test('v2 HIGH still open after cycle 2 -> structural', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => {
+    if (l.startsWith('fix:')) return FX()
+    if (l.startsWith('fixcheck:')) return chk([notOk(1)])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'structural')
+  assert.equal(r.fixCycles, 2)
+  assert.equal(r.high.length, 1)
+  assert.match(r.note, /structural decision/)
+  assert.ok(!calls.includes('fix:3'))
+})
+
+test('v2 new HIGH from fix-check counts as a blocker', async () => {
+  const { r } = await run({ ...A, fix: true }, l => {
+    if (l.startsWith('fix:')) return FX()
+    if (l === 'fixcheck:1') return chk([ok(1)], [f('HIGH', 'b.js', 3, 'new bug')])
+    if (l === 'fixcheck:2') return chk([ok(1)])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 2)
+})
+
+test('v2 leftover MEDIUM alone ships with medium[] and no second cycle', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fixcheck:1') return chk([notOk(1)])
+    return l === 'review:correctness' ? { findings: [f('MEDIUM', 'a.js', 1, 'm')] } : clean()
+  })
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 1)
+  assert.equal(r.medium.length, 1)
+  assert.ok(!calls.includes('fix:2'))
+})
+
+test('v2 fixer structural=true -> structural with its reason', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX({ structural: true, reason: 'needs a redesign', head: H40('a') })
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'structural')
+  assert.match(r.note, /needs a redesign/)
+  assert.match(r.note, /HEAD == base/)
+  assert.ok(!calls.some(c => c.startsWith('fixcheck')))
+  const bad = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mkHigh(l))
+  assert.match(bad.r.note, /WARNING/)
+})
+
+test('v2 fix-check unusable twice -> blocked, uncovered has fix-check', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l.startsWith('fixcheck:')) return chk([ok(1)], [], [])
+    return mkHigh(l)
+  })
+  assert.deepEqual(calls.filter(c => c.startsWith('fixcheck')), ['fixcheck:1', 'fixcheck:1:retry'])
+  assert.equal(r.status, 'blocked')
+  assert.ok(r.uncovered.includes('fix-check'))
+  const thr = await run({ ...A, fix: true }, l => { if (l.startsWith('fixcheck')) throw new Error('x'); return l === 'fix:1' ? FX() : mkHigh(l) })
+  assert.ok(thr.r.uncovered.includes('fix-check'))
+})
+
+test('v2 new LOW from fix-check goes to debt', async () => {
+  const { r } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fixcheck:1') return chk([ok(1)], [f('LOW', 'b.js', 3, 'nit')])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'ship')
+  assert.deepEqual(r.debt.map(d => d.title), ['nit'])
+})
+
+test('v2 fix=false: HIGH -> blocked, MEDIUM only -> ship with medium[]', async () => {
+  const h = await run(A, mkHigh)
+  assert.equal(h.r.status, 'blocked')
+  const m = await run(A, l => l === 'review:correctness' ? { findings: [f('MEDIUM', 'a.js', 1, 'm')] } : clean())
+  assert.equal(m.r.status, 'ship')
+  assert.equal(m.r.medium.length, 1)
+})
+
+test('v2 lanes run only on ship', async () => {
+  const bad = await run({ ...A, lanes: true }, mkHigh)
+  assert.ok(!bad.calls.includes('lanes'))
 })
