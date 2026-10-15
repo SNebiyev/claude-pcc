@@ -1,5 +1,5 @@
 // pcc-review v2 - ONE review per batch, a narrow fix-check of the fix diff, then a hard stop.
-// Call: Workflow({scriptPath: ".../workflows/pcc-review.js", args: {...}})
+// Call: Workflow({name: "pcc:pcc-review", args: {...}})
 // args:
 //   repo     (required) absolute path of the repo
 //   range    (required) the delta to review: "<base>..<head>" / "<base>...<head>", or a single rev "<base>"
@@ -43,6 +43,11 @@ const LANES_MODEL = 'sonnet'
 const SMALL_DELTA_LINES = 100    // changedLines below this -> one reviewer for all lenses
 const MAX_FINDINGS = 8
 const MAX_TRIED = 10
+const GIT_MODEL = 'haiku'        // read-only git probes (HEAD before/after the fixer); the script trusts git, not the fixer's word
+const SHA = /^[0-9a-f]{40}$/
+const DUP_SIM = 0.8             // title word overlap (Jaccard) needed to merge two near-line HIGHs
+const DUP_SIM_SAME_LINE = 0.5  // a looser overlap is enough when both findings sit on the very same line
+const DUP_LINE_WINDOW = 5       // two HIGHs in one file this many lines apart with similar titles share one root cause
 const MAX_FIX_CYCLES = 2         // fix + fix-check cycles per batch; blockers after the last one -> structural
 const FIX_STRUCTURAL_LINES = 150 // a fix bigger than this is a redesign: the fixer must not write it
 
@@ -137,12 +142,24 @@ const FIX_SCHEMA = {
     head: { type: 'string', description: '40-hex sha of your commit (structural: the current HEAD)' },
     base: { type: 'string', description: 'sha of HEAD before your commit (structural: the current HEAD)' },
     summary: { type: 'string', description: '<= 60 words' },
-    changedLines: { type: 'integer', minimum: 0, description: 'added+deleted lines of `git diff --numstat <base>..<head>` for your commit' },
+    changedLines: { type: 'integer', minimum: 0, description: 'added+deleted lines of `git diff --numstat <base>..<head>` for your commit (structural: 0)' },
     testsRun: { type: 'array', items: { type: 'string' } },
     concerns: { type: 'array', items: { type: 'string' } },
   },
-  required: ['head', 'base', 'summary', 'testsRun', 'concerns'],
+  required: ['head', 'base', 'summary', 'changedLines', 'testsRun', 'concerns'],
 }
+
+const GIT_SCHEMA = {
+  type: 'object',
+  properties: {
+    head: { type: 'string', description: 'exact output of `git rev-parse HEAD` (40 hex)' },
+    commits: { type: 'integer', minimum: 0, description: 'number of commits in `git rev-list --count <pre>..HEAD` (post probe only)' },
+    changedLines: { type: 'integer', minimum: 0, description: 'added+deleted lines summed from `git diff --numstat <pre>..HEAD` (post probe only; binary files count 0)' },
+  },
+  required: ['head'],
+}
+// the post-fix probe must report all three: a missing value blocks, the fixer's own numbers are never a fallback
+const POST_GIT_SCHEMA = { ...GIT_SCHEMA, required: ['head', 'commits', 'changedLines'] }
 
 const CHECK_SCHEMA = {
   type: 'object',
@@ -196,14 +213,15 @@ const LENS_TEXT = {
     'SIMPLIFY: needless complexity, duplicated helpers that already exist, dead code, hand-rolled code where a standard library exists. These are normally LOW unless they hide a real bug.',
   docs:
     'DOCS: factual accuracy against the code the text describes, contradictions, steps an agent or user could misread, missing steps; ' +
-    'for agent/policy instructions also anything that grants access or leaks data. Wording and style preferences are LOW.',
+    'for agent/policy instructions also anything that grants access or leaks data. Wording and style preferences are LOW. ' +
+    'The delta is expected to be text only: if it touches code, config or scripts, report that as a HIGH (file, line 0) because the security and correctness lenses did not run.',
 }
 
 // Risk tiers (owner decision 2026-10-15): docs -> one agent; small code delta -> one agent; otherwise one agent per lens
 // (measured: each agent has a ~60-65k token floor, and a merged correctness+simplify agent lost the simplify checks).
 function groupsFor(lines) {
   if (tier === 'docs') {
-    log('mode: docs tier -> one reviewer, lenses docs+simplify' + (useSecurity ? '' : ' (security lens off: caller passed security=false)'))
+    log('mode: docs tier -> one reviewer, lenses docs+simplify; security lens NOT run (docs tier skips it even with security=' + useSecurity + ')')
     return { mode: 'docs', groups: [['docs', 'simplify']] }
   }
   const small = lines !== null && lines < SMALL_DELTA_LINES && extra.length === 0
@@ -247,20 +265,21 @@ function reviewPrompt(lenses, range) {
   ].filter(Boolean).join('\n')
 }
 
-function verifyPrompt(f, range, idx) {
+function verifyPrompt(f, range, idx, fixDiff) {
   return [
-    `You are a skeptic. Repo (cd there): ${repo}. Delta: git diff ${range}${extra.length ? ' (plus ' + extra.join(', ') + ')' : ''}.`,
+    `You are a skeptic. Repo (cd there): ${repo}. Delta: git diff ${range}${!fixDiff && extra.length ? ' (plus ' + extra.join(', ') + ')' : ''}${fixDiff ? ' (the fix commit; the finding was reported by the fix-check)' : ''}.`,
     'A reviewer claims this HIGH finding. Try to REFUTE it: reproduce it, or show it is unreachable, bounded, already handled, or not in the delta. Refute ONLY with concrete evidence (a measurement, or a code path showing it is unreachable, bounded, already handled, or outside the delta). If you cannot show that, answer refuted=false.',
     `Finding: [${f.severity}] ${f.file}:${f.line} - ${f.title}`,
     `Evidence: ${f.evidence}`,
-    `Suggested fix: ${f.fix}`,
+    `Suggested fix: ${f.fix}${sites(f)}`,
     limitsRule,
     `No docker/servers/Playwright, never pkill/killall, no edits to tracked files. ${scratchRule(`pcc-review-verify-${idx}`)} ${NO_EXTERNAL}`,
     'Return refuted (boolean) and reason (<= 40 words).',
   ].join('\n')
 }
 
-const numbered = items => items.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line} - ${f.title}\n   evidence: ${f.evidence}\n   suggested fix: ${f.fix}`)
+const sites = f => (f.members || []).map(m => `\n   also at ${m.file}:${m.line} - ${m.title} (evidence: ${m.evidence}; fix: ${m.fix})`).join('')
+const numbered = items => items.map((f, i) => `${i + 1}. [${f.severity}] ${f.file}:${f.line} - ${f.title}\n   evidence: ${f.evidence}\n   suggested fix: ${f.fix}${sites(f)}`)
 
 function fixPrompt(items) {
   return [
@@ -318,10 +337,65 @@ let head = null
 let status = null
 let lanes = null
 let note = null
+const addNote = s => { note = note ? note + '; ' + s : s }
 
 // a throwing agent counts as a null attempt, so the retry runs
 const guard = async (prompt, opts) => { try { return await agent(prompt, opts) } catch (e) { return null } }
+const isObj = x => !!x && typeof x === 'object' && !Array.isArray(x)
 const sameKey = fd => JSON.stringify([fd.severity, fd.file, fd.line, fd.title])
+const words = t => new Set(String(t || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean))
+function sameRoot(a, b) {
+  if (a.file !== b.file) return false
+  // never merge across sites: both lines must be known and inside the window
+  if (!Number.isInteger(a.line) || !Number.isInteger(b.line) || Math.abs(a.line - b.line) > DUP_LINE_WINDOW) return false
+  const wa = words(a.title), wb = words(b.title)
+  const union = new Set([...wa, ...wb]).size
+  if (!union) return String(a.title || '').trim() === String(b.title || '').trim() // no word tokens: exact title only
+  const inter = [...wa].filter(w => wb.has(w)).length
+  return inter / union >= (a.line === b.line ? DUP_SIM_SAME_LINE : DUP_SIM)
+}
+// HIGHs with the same root cause (same file, near line, near-identical title) get ONE skeptic; merged members stay on the group so the skeptic, fixer and fix-check see every site
+function dedupHighs(list) {
+  const groups = []
+  for (const f of list) {
+    const g = groups.find(x => sameRoot(x, f))
+    if (g) {
+      if (f.lens && f.lens !== g.lens && !(g.alsoFoundBy || []).includes(f.lens)) g.alsoFoundBy = (g.alsoFoundBy || []).concat(f.lens)
+      g.members.push({ lens: f.lens, file: f.file, line: f.line, title: f.title, evidence: f.evidence, fix: f.fix })
+      log(`HIGH merged with an earlier one (same root cause) - ${f.file}:${f.line} ${f.title}`)
+    } else groups.push({ ...f, members: [] })
+  }
+  return groups
+}
+// verify groups of HIGHs: one skeptic per group; returns survivors and refuted
+// prefix '' = reviewer HIGHs; `fcN` = HIGHs a fix-check found (label, tag and fixDiff derive from it)
+async function verifyHighs(list, rng, prefix) {
+  const groups = dedupHighs(list)
+  const survivors = [], refuted = []
+  if (!groups.length) return { survivors, refuted }
+  const verdicts = await parallel(groups.map((f, i) => () =>
+    agent(verifyPrompt(f, rng, prefix ? `${prefix}-${i + 1}` : i + 1, !!prefix), { label: prefix ? `verify:${prefix}:${i + 1}` : `verify${i + 1}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA })))
+  groups.forEach((f, i) => {
+    const v = verdicts[i]
+    if (v && v.refuted === true) {
+      log(`HIGH dropped as refuted - ${f.file}:${f.line} ${f.title} (${v.reason})`)
+      refuted.push({ ...f, reason: v.reason })
+    } else if (!v) {
+      log(`verifier failed, HIGH kept unverified - ${f.file}:${f.line} ${f.title}`)
+      survivors.push({ ...f, unverified: true })
+    } else survivors.push(f)
+  })
+  return { survivors, refuted }
+}
+function gitPrompt(pre) {
+  return [
+    `Read-only git probe in ${repo} (cd there). Run exactly these commands and return their facts. Change nothing; do not edit, commit, stash or checkout.`,
+    '1. `git rev-parse HEAD` -> head (the 40-hex output, verbatim).',
+    pre ? `2. \`git rev-list --count ${pre}..HEAD\` -> commits.` : '',
+    pre ? `3. \`git diff --numstat ${pre}..HEAD\` -> changedLines = sum of added+deleted over all rows (a "-" for a binary file counts 0).` : '',
+    NO_EXTERNAL,
+  ].filter(Boolean).join('\n')
+}
 
 // ---------------------------------------------------------------- review (once)
 phase('Review')
@@ -352,8 +426,9 @@ groups.forEach((g, i) => {
       tried[l].push(...cleanTried(x, l))
     }
     if (!Array.isArray(x.findings)) continue
-    const keys = x.findings.map(sameKey)
-    x.findings.forEach((fd, j) => { if (!seen.has(keys[j])) raw.push({ ...fd, lens: rep.gk }) })
+    const fds = x.findings.filter(isObj) // a null / non-object entry is dropped, never a crash
+    const keys = fds.map(sameKey)
+    fds.forEach((fd, j) => { if (!seen.has(keys[j])) raw.push({ ...fd, lens: rep.gk }) })
     keys.forEach(k => seen.add(k))
   }
 })
@@ -364,22 +439,11 @@ debt.push(...raw.filter(f => f.severity === 'LOW'))
 
 // ---------------------------------------------------------------- verify
 phase('Verify')
-const survivors = []
+let survivors = []
 if (highs.length) {
-  const verdicts = await parallel(highs.map((f, i) => () =>
-    agent(verifyPrompt(f, baseRange, i + 1), { label: `verify${i + 1}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA })))
-  highs.forEach((f, i) => {
-    const v = verdicts[i]
-    if (v && v.refuted === true) {
-      log(`HIGH dropped as refuted - ${f.file}:${f.line} ${f.title} (${v.reason})`)
-      refutedHigh.push({ ...f, reason: v.reason })
-    } else if (!v) {
-      log(`verifier failed, HIGH kept unverified - ${f.file}:${f.line} ${f.title}`)
-      survivors.push({ ...f, unverified: true })
-    } else {
-      survivors.push(f)
-    }
-  })
+  const vr = await verifyHighs(highs, baseRange, '')
+  survivors = vr.survivors
+  refutedHigh.push(...vr.refuted)
 } else {
   log('no HIGH findings, verify skipped')
 }
@@ -402,59 +466,95 @@ while (!status) {
   const cyc = `c${fixCycles}`
 
   phase('Fix')
+  // the script reads HEAD itself (a read-only git agent) before and after the fixer: git, not the fixer's word, decides
+  // cycle 1 probes HEAD; later cycles start from the head the previous post probe returned (no second probe), so a commit that
+  // landed in between shows up in the post probe's commit count and blocks
+  const pre = fixCycles === 1 ? await guard(gitPrompt(null), { label: `git:pre:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, schema: GIT_SCHEMA }) : { head }
+  if (!pre || !SHA.test(pre.head)) {
+    status = 'blocked'
+    addNote('could not read HEAD with git before the fix; no fixer was started')
+    log(`${cyc}: ${note}`)
+    break
+  }
   const fx = await guard(fixPrompt(items), { label: `fix:${fixCycles}`, phase: 'Fix', model: FIX_MODEL, schema: FIX_SCHEMA })
+  const post = await guard(gitPrompt(pre.head), { label: `git:post:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, schema: POST_GIT_SCHEMA })
+  if (!post || !SHA.test(post.head)) {
+    status = 'blocked'
+    addNote(`could not read HEAD with git after the fix; HEAD may hold an unreviewed commit - inspect or revert HEAD (was ${pre.head})`)
+    log(`${cyc}: ${note}`)
+    break
+  }
+  const committed = post.head !== pre.head
   if (fx && fx.structural === true) {
     const hasHigh = items.some(f => f.severity === 'HIGH')
     status = hasHigh ? 'structural' : 'ship' // the severity gate: a MEDIUM never blocks, only a HIGH goes structural
-    note = `fixer says the fix is structural: ${fx.reason || 'no reason given'}`
-    if (!hasHigh) note += ' (MEDIUM-only batch: not blocking, shipping with medium[])'
-    if (fx.head !== fx.base) {
-      note += ' - WARNING: the fixer committed anyway (head != base); inspect HEAD'
+    addNote(`fixer says the fix is structural: ${fx.reason || 'no reason given'}`)
+    if (!committed) {
+      if (!hasHigh) addNote('MEDIUM-only batch: not blocking, shipping with medium[]')
+      addNote('no commit made, HEAD == base, checked with git')
+    } else {
+      addNote(`WARNING: git HEAD moved from ${pre.head} to ${post.head} although the fixer said structural; the unreviewed commit is not shipped, inspect HEAD`)
+      head = post.head
       if (!hasHigh) status = 'blocked' // an unreviewed commit is never shipped
-    } else note += ' (no commit made, HEAD == base)'
+    }
     if (!hasHigh) { high = []; medium = items }
     log(`${cyc}: ${note}`)
     break
   }
-  if (!fx || !/^[0-9a-f]{40}$/.test(fx.head) || !/^[0-9a-f]{40}$/.test(fx.base) || fx.base === fx.head) {
-    log(`${cyc}: fixer failed or returned a bad/empty sha range; the fixer may have committed unreviewed code -> blocked`)
+  if (!fx || !committed || post.commits !== 1 || !Number.isInteger(post.changedLines)) {
     status = 'blocked'
-    note = 'fixer failed or returned a bad sha range; HEAD may hold an unreviewed commit - inspect or revert HEAD before shipping'
+    addNote(!fx
+      ? (committed ? `fixer failed but git HEAD moved (${pre.head} -> ${post.head}); HEAD holds an unreviewed commit - inspect or revert HEAD before shipping`
+        : 'fixer failed and made no commit (git HEAD unchanged); inspect HEAD')
+      : !committed ? 'fixer reported a fix but git HEAD did not move (no commit); inspect HEAD'
+      : post.commits !== 1 ? `git shows ${Number.isInteger(post.commits) ? post.commits : 'an unknown number of'} commits after the fix, expected exactly one; HEAD holds unreviewed commits - inspect or revert HEAD (was ${pre.head})`
+      : `git did not report the size of the fix commit (changedLines missing); HEAD holds an unreviewed commit - inspect or revert HEAD (was ${pre.head})`)
+    if (committed) head = post.head
+    log(`${cyc}: ${note}`)
     break
   }
-  if (!Number.isInteger(fx.changedLines) || fx.changedLines > FIX_STRUCTURAL_LINES) {
+  const fixBase = pre.head, fixHead = post.head
+  if (fx.head !== fixHead || fx.base !== fixBase) {
+    addNote(`fixer reported head/base ${fx.head}/${fx.base} but git says ${fixHead}/${fixBase}; the script used git`)
+    log(`${cyc}: ${note}`)
+  }
+  const lines = post.changedLines // git's count only, never the fixer's claim
+  if (lines > FIX_STRUCTURAL_LINES) {
     status = 'structural'
-    note = `fixer's commit is ${Number.isInteger(fx.changedLines) ? fx.changedLines + ' changed lines (> ' + FIX_STRUCTURAL_LINES + ')' : 'of unreported size (changedLines missing)'}: a redesign, not a fix; HEAD holds an unreviewed commit - inspect or revert it`
-    head = fx.head
+    addNote(`fixer's commit is ${lines} changed lines (> ${FIX_STRUCTURAL_LINES}): a redesign, not a fix; HEAD holds an unreviewed commit - inspect or revert it`)
+    head = fixHead
     log(`${cyc}: ${note}`)
     break
   }
   if (fx.concerns && fx.concerns.length) log(`${cyc}: fixer concerns (orchestrator must read before merge): ${fx.concerns.join(' | ')}`)
-  head = fx.head
-  range = `${fx.base}..${fx.head}`
+  head = fixHead
+  range = `${fixBase}..${fixHead}`
   log(`${cyc}: fixed ${items.length} finding(s) in ${range}; fix-check reads only this diff`)
 
   phase('Fix-check')
   const usable = x => !!x && Array.isArray(x.results) && Array.isArray(x.newFindings) && cleanList(x.tried).length > 0 &&
     x.results.every(r => r && Number.isInteger(r.index) && typeof r.fixed === 'boolean')
-  let chk = await guard(checkPrompt(items, fx.base, fx.head, fixCycles), { label: `fixcheck:${fixCycles}`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+  let chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
   if (!usable(chk)) {
     log(`${cyc}: fix-check returned nothing or an unusable result, retrying once`)
-    chk = await guard(checkPrompt(items, fx.base, fx.head, fixCycles), { label: `fixcheck:${fixCycles}:retry`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+    chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}:retry`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
   }
   if (!usable(chk)) {
     uncovered.push('fix-check')
     status = 'blocked'
-    note = `fix-check unusable twice for ${range}; the fix commit is unreviewed`
+    addNote(`fix-check unusable twice for ${range}; the fix commit is unreviewed`)
     log(`${cyc}: ${note}`)
     break
   }
   const isFixed = i => chk.results.some(r => r.index === i + 1 && r.fixed === true)
   const open = items.filter((f, i) => !isFixed(i))
-  const newF = chk.newFindings
-  fixChecks.push({ cycle: fixCycles, base: fx.base, head: fx.head, results: chk.results, newFindings: newF, tried: cleanList(chk.tried) })
+  const newF = chk.newFindings.filter(isObj)
+  fixChecks.push({ cycle: fixCycles, base: fixBase, head: fixHead, results: chk.results, newFindings: newF, tried: cleanList(chk.tried) })
   debt.push(...newF.filter(f => f.severity === 'LOW'))
-  const blockers = open.filter(f => f.severity === 'HIGH').concat(newF.filter(f => f.severity === 'HIGH'))
+  // a HIGH the fix-check found goes through the same skeptic as a reviewer HIGH before it can block
+  const vr = await verifyHighs(newF.filter(f => f.severity === 'HIGH'), range, `fc${fixCycles}`)
+  refutedHigh.push(...vr.refuted)
+  const blockers = open.filter(f => f.severity === 'HIGH').concat(vr.survivors)
   medium = open.filter(f => f.severity === 'MEDIUM').concat(newF.filter(f => f.severity === 'MEDIUM')) // for cards; never opens a cycle alone
   high = blockers
   log(`${cyc}: fix-check: ${items.length - open.length}/${items.length} fixed, ${blockers.length} blocker(s), ${medium.length} leftover MEDIUM`)
@@ -462,7 +562,7 @@ while (!status) {
   if (!blockers.length) { status = 'ship'; break }
   if (fixCycles >= MAX_FIX_CYCLES) {
     status = 'structural'
-    note = `${blockers.length} HIGH still open after fix cycle ${fixCycles}: stop patching, take a structural decision with the owner`
+    addNote(`${blockers.length} HIGH still open after fix cycle ${fixCycles}: stop patching, take a structural decision with the owner`)
     log(`${cyc}: ${note}`)
     break
   }
@@ -474,7 +574,7 @@ if (uncovered.length && status !== 'structural') {
   const u = Array.from(new Set(uncovered)).join(', ')
   log(`status forced to blocked: uncovered: ${u}`)
   status = 'blocked'
-  note = (note ? note + '; ' : '') + `uncovered: ${u}`
+  addNote(`uncovered: ${u}`)
 }
 
 // ---------------------------------------------------------------- lanes
@@ -488,7 +588,7 @@ if (status === 'ship' && doLanes) {
   })
   const laneList = lanes && Array.isArray(lanes.lanes) ? lanes.lanes : []
   const skippedLanes = laneList.filter(l => l.result === 'skipped').map(l => l.name)
-  if (skippedLanes.length) note = (note ? note + '; ' : '') + `lanes skipped: ${skippedLanes.join(', ')}`
+  if (skippedLanes.length) addNote(`lanes skipped: ${skippedLanes.join(', ')}`)
   if (!lanes || lanes.verdict !== 'green' || !laneList.length || laneList.some(l => l.result === 'fail') || !laneList.some(l => l.result === 'pass')) {
     log('lanes: red, failed lane, empty lanes, no passing lane or no result -> status blocked')
     status = 'blocked'

@@ -9,45 +9,45 @@ const AsyncFn = Object.getPrototypeOf(async function () {}).constructor
 const H40 = c => c.repeat(40)
 
 // A reviewer answer is described neutrally as {findings, tried?: {lens: [..]}}; the harness shapes `tried`
-// to whatever the schema the script asked for says (per-lens object, or the old flat array).
+// to the per-lens object the schema asks for.
 function shape(res, schema) {
   if (!res || !schema || !schema.properties || !schema.properties.tried || !res.findings) return res
-  const lenses = schema.properties.tried.type === 'object' ? Object.keys(schema.properties.tried.properties) : null
   const map = res.tried || {}
-  if (lenses) {
-    const tried = {}
-    for (const l of lenses) tried[l] = l in map ? map[l] : ['t']
-    return { findings: res.findings, tried }
-  }
-  return { findings: res.findings, tried: Object.keys(map).length ? Object.values(map).flat() : ['t'] }
+  const tried = {}
+  for (const l of Object.keys(schema.properties.tried.properties)) tried[l] = l in map ? map[l] : ['t']
+  return { findings: res.findings, tried }
 }
 
-function run(args, handler) {
+// The script reads git HEAD through read-only `git:pre:1` / `git:post:N` agents (cycle 1 only probes pre). The harness simulates a repo: HEAD starts at
+// H40('a'); a successful non-structural fixer stub moves it to its reported head. `git(label, sim)` overrides a probe answer.
+function run(args, handler, git) {
   const calls = []
   const prompts = {}
+  const logs = []
+  const schemas = {}
+  const sim = { head: H40('a'), pre: H40('a'), last: null }
   // {raw: X} from a handler is returned to the script unshaped; a handler that throws makes the agent call reject
-  const agent = async (prompt, o) => { calls.push(o.label); prompts[o.label] = prompt; const h = handler(o.label, prompt); return h && 'raw' in h && Object.keys(h).length === 1 ? h.raw : shape(h, o.schema) }
+  const agent = async (prompt, o) => {
+    calls.push(o.label); prompts[o.label] = prompt; schemas[o.label] = o.schema
+    if (o.label.startsWith('git:')) {
+      const own = git && git(o.label, sim)
+      if (own !== undefined) return own && 'raw' in own && Object.keys(own).length === 1 ? own.raw : own
+      return o.label.startsWith('git:pre') ? { head: sim.head }
+        : { head: sim.head, commits: sim.head === sim.pre ? 0 : 1, changedLines: sim.last ? sim.last.changedLines : undefined }
+    }
+    if (o.label.startsWith('fix:')) sim.pre = sim.head // the script carries post.head into later cycles instead of probing again
+    const h = handler(o.label, prompt)
+    if (o.label.startsWith('fix:') && h && h.structural !== true && /^[0-9a-f]{40}$/.test(h.head || '')) { sim.head = h.head; sim.last = h }
+    return h && 'raw' in h && Object.keys(h).length === 1 ? h.raw : shape(h, o.schema)
+  }
   // like the real parallel(): a thunk that throws yields null instead of rejecting
   const parallel = fns => Promise.all(fns.map(f => f().catch(() => null)))
-  return new AsyncFn('args', 'agent', 'parallel', 'phase', 'log', src)(args, agent, parallel, () => {}, () => {}).then(r => ({ r, calls, prompts }))
+  return new AsyncFn('args', 'agent', 'parallel', 'phase', 'log', src)(args, agent, parallel, () => {}, m => logs.push(m)).then(r => ({ r, calls, prompts, logs, schemas }))
 }
 const A = { repo: '/x', range: 'a..b' }
 const clean = () => ({ findings: [] })
 const f = (severity, file, line, title) => ({ severity, file, line, title, evidence: 'e', fix: 'f' })
 const reviews = calls => calls.filter(c => /^review:[a-z+]+(:retry)?$/.test(c))
-
-test('fixer short sha -> blocked', async () => {
-  const { r } = await run({ ...A, fix: true }, l => l.startsWith('fix:') ? { head: 'abc1234', base: H40('a'), summary: '', testsRun: [], concerns: [] }
-    : l.startsWith('review:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
-  assert.equal(r.status, 'blocked')
-  assert.match(r.note, /HEAD/)
-})
-
-test('fixer base == head -> blocked', async () => {
-  const { r } = await run({ ...A, fix: true }, l => l.startsWith('fix:') ? { head: H40('a'), base: H40('a'), summary: '', testsRun: [], concerns: [] }
-    : l.startsWith('review:correctness') ? { findings: [f('MEDIUM', 'a.js', 10, 'm')] } : clean())
-  assert.equal(r.status, 'blocked')
-})
 
 test('refuted HIGH does not hide a distinct HIGH from another lens', async () => {
   const { r } = await run(A, l => {
@@ -239,15 +239,15 @@ test('ITEM4 rev validity table', async () => {
   }
 })
 
-test('ITEM6 exact duplicate across attempts is dropped; near-duplicates are kept', async () => {
+test('ITEM6 exact duplicate across attempts is dropped; same root cause (SPD-1197) shares one skeptic', async () => {
   const { r, calls } = await run(A, l => {
     if (l === 'review:security') return { findings: [f('HIGH', 'a.js', 10, 'xss')], tried: { security: [] } }
     if (l === 'review:security:retry') return { findings: [f('HIGH', 'a.js', 10, 'xss'), f('HIGH', 'a.js', 11, 'xss')] }
     if (l.includes('verify')) return { refuted: false, reason: 'r' }
     return clean()
   })
-  assert.equal(calls.filter(c => c.includes('verify')).length, 2)
-  assert.equal(r.high.length, 2)
+  assert.equal(calls.filter(c => c.includes('verify')).length, 1)
+  assert.equal(r.high.length, 1)
 })
 
 test('ITEM10 small mode: tried missing a lens key -> retry -> uncovered, blocked', async () => {
@@ -338,7 +338,8 @@ test('v2 fix-check: HIGH unfixed -> second cycle -> clean -> ship', async () => 
 
 test('v2 HIGH still open after cycle 2 -> structural', async () => {
   const { r, calls } = await run({ ...A, fix: true }, l => {
-    if (l.startsWith('fix:')) return FX()
+    if (l === 'fix:1') return FX()
+    if (l === 'fix:2') return FX({ head: H40('c'), base: H40('b') })
     if (l.startsWith('fixcheck:')) return chk([notOk(1)])
     return mkHigh(l)
   })
@@ -349,9 +350,10 @@ test('v2 HIGH still open after cycle 2 -> structural', async () => {
   assert.ok(!calls.includes('fix:3'))
 })
 
-test('v2 new HIGH from fix-check counts as a blocker', async () => {
+test('v2 new HIGH from fix-check counts as a blocker (after its skeptic)', async () => {
   const { r } = await run({ ...A, fix: true }, l => {
-    if (l.startsWith('fix:')) return FX()
+    if (l === 'fix:1') return FX()
+    if (l === 'fix:2') return FX({ head: H40('c'), base: H40('b') })
     if (l === 'fixcheck:1') return chk([ok(1)], [f('HIGH', 'b.js', 3, 'new bug')])
     if (l === 'fixcheck:2') return chk([ok(1)])
     return mkHigh(l)
@@ -381,16 +383,46 @@ test('v2 fixer structural=true -> structural with its reason', async () => {
   assert.match(r.note, /needs a redesign/)
   assert.match(r.note, /HEAD == base/)
   assert.ok(!calls.some(c => c.startsWith('fixcheck')))
-  const bad = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mkHigh(l))
+  const bad = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mkHigh(l),
+    l => l === 'git:post:1' ? { head: H40('b'), commits: 1, changedLines: 3 } : undefined)
   assert.match(bad.r.note, /WARNING/)
 })
 
-test('v2 fixer commit over the line limit or without changedLines -> structural', async () => {
-  for (const over of [{ changedLines: 400 }, { changedLines: undefined }]) {
-    const { r, calls } = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX(over) : mkHigh(l))
-    assert.equal(r.status, 'structural')
+test('v2 fixer commit over the line limit -> structural; git omitting changedLines or commits -> blocked, never the fixer claim', async () => {
+  const big = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ changedLines: 400 }) : mkHigh(l))
+  assert.equal(big.r.status, 'structural')
+  assert.ok(!big.calls.some(c => c.startsWith('fixcheck')))
+  for (const miss of [{ commits: 1 }, { changedLines: 3 }]) {
+    const { r, calls } = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ changedLines: 3 }) : mkHigh(l),
+      l => l === 'git:post:1' ? { head: H40('b'), ...miss } : undefined)
+    assert.equal(r.status, 'blocked', JSON.stringify(miss))
     assert.ok(!calls.some(c => c.startsWith('fixcheck')))
   }
+})
+
+test('post probe has its own schema requiring head, commits and changedLines; notes accumulate; cycle 2 has no pre probe', async () => {
+  const { r, calls, schemas } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX({ head: H40('c'), base: H40('z') }) // wrong base: git mismatch note
+    if (l === 'fix:2') return FX({ head: H40('d'), base: H40('c') })
+    if (l.startsWith('fixcheck:')) return chk([notOk(1)])
+    return mkHigh(l)
+  })
+  assert.deepEqual(schemas['git:post:1'].required.slice().sort(), ['changedLines', 'commits', 'head'])
+  assert.deepEqual(schemas['git:pre:1'].required, ['head'])
+  assert.ok(!calls.includes('git:pre:2'))
+  assert.equal(r.status, 'structural')
+  assert.match(r.note, /fixer reported head\/base.*; .*structural decision/) // the mismatch warning survives the structural note
+})
+
+test('cycle 2: another commit landed after cycle 1 -> blocked', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fix:2') return FX({ head: H40('d'), base: H40('c') })
+    if (l === 'fixcheck:1') return chk([notOk(1)])
+    return mkHigh(l)
+  }, l => l === 'git:post:2' ? { head: H40('d'), commits: 2, changedLines: 5 } : undefined)
+  assert.equal(r.status, 'blocked')
+  assert.ok(!calls.includes('fixcheck:2'))
 })
 
 test('v2 fixer structural=true on a MEDIUM-only batch ships with medium[]', async () => {
@@ -436,4 +468,157 @@ test('v2 fix=false: HIGH -> blocked, MEDIUM only -> ship with medium[]', async (
 test('v2 lanes run only on ship', async () => {
   const bad = await run({ ...A, lanes: true }, mkHigh)
   assert.ok(!bad.calls.includes('lanes'))
+})
+
+// ---------------------------------------------------------------- debt batch (SPD-1189)
+const mk = (...xs) => l => l.startsWith('review:correctness') ? { findings: xs } : l.startsWith('verify') ? { refuted: false, reason: 'r' } : clean()
+
+test('SPD-1190 FIX_SCHEMA requires changedLines', async () => {
+  const { schemas } = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX() : l.startsWith('fixcheck') ? chk([ok(1)]) : mkHigh(l))
+  assert.ok(schemas['fix:1'].required.includes('changedLines'))
+})
+
+test('SPD-1191 new HIGH from fix-check goes to a skeptic first; refuted -> no blocker, no second cycle', async () => {
+  const { r, calls, prompts } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fixcheck:1') return chk([ok(1)], [f('HIGH', 'b.js', 3, 'new bug')])
+    if (l === 'verify:fc1:1') return { refuted: true, reason: 'unreachable' }
+    return mkHigh(l)
+  })
+  assert.ok(calls.includes('verify:fc1:1'))
+  assert.match(prompts['verify:fc1:1'], /new bug/)
+  assert.equal(r.status, 'ship')
+  assert.equal(r.fixCycles, 1)
+  assert.deepEqual(r.high, [])
+  assert.ok(r.refutedHigh.some(x => x.title === 'new bug'))
+})
+
+test('SPD-1191 unrefuted new HIGH after cycle 2 -> structural', async () => {
+  const { r } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fix:2') return FX({ head: H40('c'), base: H40('b') })
+    if (l.startsWith('fixcheck:')) return chk([ok(1)], [f('HIGH', 'b.js', 3, 'new bug')])
+    return mkHigh(l)
+  })
+  assert.equal(r.status, 'structural')
+})
+
+test('SPD-1192 docs tier always logs that the security lens did not run, even with security=true', async () => {
+  for (const security of [true, false, undefined]) {
+    const { logs, calls, prompts } = await run({ ...A, tier: 'docs', security }, clean)
+    assert.ok(logs.some(m => /security lens NOT run/.test(m)), String(security))
+    assert.deepEqual(reviews(calls), ['review:docs+simplify'])
+    assert.match(prompts['review:docs+simplify'], /touches code, config or scripts/)
+  }
+})
+
+test('SPD-1193 fixer says structural but git HEAD moved -> WARNING, never shipped', async () => {
+  const hi = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mkHigh(l),
+    l => l === 'git:post:1' ? { head: H40('b'), commits: 1, changedLines: 3 } : undefined)
+  assert.equal(hi.r.status, 'structural')
+  assert.match(hi.r.note, /WARNING: git HEAD moved/)
+  assert.equal(hi.r.head, H40('b'))
+  const med = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x' }) : mk(f('MEDIUM', 'a.js', 1, 'm'))(l),
+    l => l === 'git:post:1' ? { head: H40('b'), commits: 1, changedLines: 3 } : undefined)
+  assert.equal(med.r.status, 'blocked')
+  assert.doesNotMatch(med.r.note, /shipping with medium/) // SPD-1195: the note must not say shipping
+  assert.match(med.r.note, /not shipped/)
+  const clean2 = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ structural: true, reason: 'x', head: H40('a') }) : mk(f('MEDIUM', 'a.js', 1, 'm'))(l))
+  assert.equal(clean2.r.status, 'ship')
+  assert.match(clean2.r.note, /shipping with medium\[\]/)
+  assert.match(clean2.r.note, /checked with git/)
+})
+
+test('SPD-1193 git probe unreadable -> blocked, before and after the fixer', async () => {
+  const pre = await run({ ...A, fix: true }, mkHigh, l => l === 'git:pre:1' ? { head: 'nope' } : undefined)
+  assert.equal(pre.r.status, 'blocked')
+  assert.ok(!pre.calls.includes('fix:1'))
+  const post = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX() : mkHigh(l), l => l === 'git:post:1' ? { raw: null } : undefined)
+  assert.equal(post.r.status, 'blocked')
+  assert.ok(!post.calls.some(c => c.startsWith('fixcheck')))
+})
+
+test('SPD-1194 null / non-object findings entries do not crash the workflow', async () => {
+  const { r } = await run(A, l => l === 'review:security' ? { raw: { findings: [null, 'x', f('LOW', 'a.js', 1, 'l'), 5], tried: { security: ['t'] } } } : clean())
+  assert.equal(r.status, 'ship')
+  assert.equal(r.debt.length, 1)
+  const fc = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX()
+    if (l === 'fixcheck:1') return chk([ok(1)], [null, f('LOW', 'b.js', 3, 'nit')])
+    return mkHigh(l)
+  })
+  assert.equal(fc.r.status, 'ship')
+})
+
+test('SPD-1197 HIGHs with the same root cause get one skeptic; different causes keep their own', async () => {
+  const same = await run(A, l => {
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'issues.go', 40, 'MentionNames removed, issues.go does not build')] }
+    if (l.startsWith('review:correctness')) return { findings: [f('HIGH', 'issues.go', 43, 'MentionNames removed, issues.go does not build!')] }
+    if (l.startsWith('review:simplify')) return { findings: [f('HIGH', 'issues.go', 90, 'MentionNames removed, issues.go does not build')] } // far line, same title: another site, own skeptic
+    if (l.startsWith('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(same.calls.filter(c => c.startsWith('verify')).length, 2)
+  assert.equal(same.r.high.length, 2)
+  assert.deepEqual(same.r.high[0].alsoFoundBy, ['correctness'])
+  assert.equal(same.r.high[0].members[0].line, 43)
+  const diff = await run(A, l => {
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'a.go', 10, 'xss in render')] }
+    if (l.startsWith('review:correctness')) return { findings: [f('HIGH', 'b.go', 10, 'xss in render')] } // other file
+    if (l.startsWith('review:simplify')) return { findings: [f('HIGH', 'a.go', 11, 'data loss on save')] } // near line, different cause
+    if (l.startsWith('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(diff.calls.filter(c => c.startsWith('verify')).length, 3)
+  // near titles but different sinks, blank and non-ASCII titles stay separate; merged members reach the skeptic prompt
+  const sinks = await run(A, l => {
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'a.js', 10, 'xss in render title'), f('HIGH', 'a.js', 12, 'xss in render body'), f('HIGH', 'a.js', 14, ''), f('HIGH', 'a.js', 15, ''), f('HIGH', 'a.js', 16, 'Ошибка доступа'), f('HIGH', 'a.js', 17, 'Ошибка прав')] }
+    if (l.startsWith('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(sinks.r.high.length, 5)
+  // same line: a looser overlap (sim >= 0.5) merges, a different line with the same sim does not; a same-lens duplicate names no lens
+  const sameLine = await run(A, l => {
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'a.go', 40, 'MentionNames removed, issues.go does not build'), f('HIGH', 'b.go', 40, 'MentionNames removed, issues.go does not build')] }
+    if (l.startsWith('review:correctness')) return { findings: [f('HIGH', 'a.go', 40, 'MentionNames removed so issues.go build fails'), f('HIGH', 'b.go', 41, 'MentionNames removed so issues.go build fails')] }
+    if (l.startsWith('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(sameLine.r.high.length, 3) // a.go:40 merged, b.go:40 and b.go:41 stay apart
+  assert.deepEqual(sameLine.r.high.find(h => h.file === 'a.go').alsoFoundBy, ['correctness'])
+  const merged = await run(A, l => {
+    if (l.startsWith('review:security')) return { findings: [f('HIGH', 'a.js', 40, 'stored xss via title')] }
+    if (l.startsWith('review:correctness')) return { findings: [f('HIGH', 'a.js', 42, 'stored xss via title')] }
+    if (l.startsWith('verify')) return { refuted: false, reason: 'r' }
+    return clean()
+  })
+  assert.equal(merged.r.high.length, 1)
+  assert.ok(Object.values(merged.prompts).some(p => p.includes('also at a.js:42')))
+})
+
+test('SPD-1204 fixer returns head=base=placeholder but git shows exactly one commit -> fix-check still runs on git sha range', async () => {
+  const { r, calls, prompts } = await run({ ...A, fix: true }, l => {
+    if (l === 'fix:1') return FX({ head: H40('a'), base: H40('a'), summary: 'placeholder' })
+    if (l === 'fixcheck:1') return chk([ok(1)])
+    return mkHigh(l)
+  }, l => l === 'git:post:1' ? { head: H40('c'), commits: 1, changedLines: 12 } : undefined)
+  assert.ok(calls.includes('fixcheck:1'))
+  assert.equal(r.status, 'ship')
+  assert.equal(r.head, H40('c'))
+  assert.match(prompts['fixcheck:1'], new RegExp(`git diff ${H40('a')}\\.\\.${H40('c')}`))
+  assert.match(r.note, /fixer reported head\/base/)
+})
+
+test('SPD-1204 negative: fixer claims a good commit but git HEAD did not move -> blocked, no fix-check', async () => {
+  const { r, calls } = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX() : mkHigh(l),
+    l => l === 'git:post:1' ? { head: H40('a'), commits: 0, changedLines: 0 } : undefined)
+  assert.equal(r.status, 'blocked')
+  assert.ok(!calls.some(c => c.startsWith('fixcheck')))
+})
+
+test('SPD-1204 git shows two commits -> blocked; git line count over the limit -> structural', async () => {
+  const two = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX() : mkHigh(l), l => l === 'git:post:1' ? { head: H40('b'), commits: 2, changedLines: 5 } : undefined)
+  assert.equal(two.r.status, 'blocked')
+  const big = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ changedLines: 1 }) : mkHigh(l), l => l === 'git:post:1' ? { head: H40('b'), commits: 1, changedLines: 999 } : undefined)
+  assert.equal(big.r.status, 'structural') // git's count wins over the fixer's claim
 })

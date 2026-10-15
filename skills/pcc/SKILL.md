@@ -175,7 +175,23 @@ Measured: fix rounds that each re-opened a full 3-lens review ran 1-2 days and 2
 | code, >= 100 lines, has a file outside the adapter's `low_risk_paths` | three agents |
 | code, >= 100 lines, otherwise | two agents (correctness, simplify; `security: false`) |
 
-Adapters declare `low_risk_paths:` as one regex line: paths that cannot carry a security defect (prose docs, tests, CSS, raster images). The rule is fail-safe: `security` is true unless EVERY changed file matches it. The caller computes it over the union of `range` and every `extra` entry (uncommitted fixes included): `files=$(git diff --no-renames --name-only <range>; git diff --no-renames --name-only <each extra>)`, then `security=true` if any diff command failed or `files` is empty, else `printf '%s\n' "$files" | command grep -Evq '<low_risk_paths regex>'` (`command grep`: Claude Code's grep shell function (ugrep) exits 1 on `-vq` over stdin, which would make security false) (exit 1 -> false, any other exit (0, 2 on a regex error, ...) -> true); an unlisted file defaults to security on, and no `low_risk_paths` line -> `security: true`. Agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, `.claude/`) must not be listed as low risk.
+Adapters declare `low_risk_paths:` as one regex line: paths that cannot carry a security defect (prose docs, tests, CSS, raster images). The rule is fail-safe: `security` is true unless EVERY changed file matches it. The caller computes it over the union of `range` and every `extra` entry (uncommitted fixes included) with this snippet:
+
+```
+security=true; files=""
+for r in <range> <each extra>; do
+  out=$(git diff --no-renames --name-only "$r") || { files=""; break; }   # a failed diff stays security=true
+  [ -n "$out" ] && files="$files$out"$'\n'
+done
+if [ -n "$files" ]; then
+  printf '%s' "$files" | command grep -Evq '<low_risk_paths regex>'
+  [ $? -eq 1 ] && security=false   # exit 1 only: every file matched the regex
+fi
+```
+
+Exit rule: grep exit 1 means every changed file matches the regex, so `security=false`; ANY other exit (0 = some file is not low risk, 2 = a broken regex, ...) leaves `security=true`. Use `command grep`: Claude Code's `grep` shell function (ugrep) exits 1 on `-vq` over stdin, which would make security false. Each diff runs on its own, so a failed `git diff` is never hidden by a later successful one. Two different cases both mean true: no `low_risk_paths` line in the adapter, and an empty or failed file list.
+
+Agent-instruction files (SKILL.md, CLAUDE.md, AGENTS.md, `.claude/`) must not be listed as low risk.
 
 ## Reuse an expensive step only when its inputs are byte-identical
 
