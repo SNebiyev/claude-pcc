@@ -142,6 +142,7 @@ Cost line: `python3 -I scripts/pcc-cost.py --project-dir ~/.claude/projects/<key
 
 ## Changelog
 
+- **2.1.0** - `pcc-review` trusts git over the fixer: a haiku probe reads HEAD before the first fix and after each fix, exactly one new commit is required, and a missing value blocks. A HIGH found by fix-check goes through a skeptic before it blocks. HIGHs with the same root cause share one skeptic (`members`, `alsoFoundBy`). Null findings are dropped and `FIX_SCHEMA` requires `changedLines`. The docs tier logs that the security lens was skipped. The security formula runs each diff on its own and fails safe (exit 1 -> false, any other exit -> true).
 - **2.0.0** - `pcc-review` v2: one review per batch, fix-check of the fix diff, max 2 fix cycles, then `structural`. Args: `round` removed (throws), `security` and `tier` added. Returns `roundsUsed` replaced by `mode`, `fixCycles`, `fixChecks`. Skill: severity gate replaces fix-everything for review findings, reviewer budget, risk tiers, cost line. New `scripts/pcc-cost.py`. Adapters now declare the fail-safe `low_risk_paths` (an unlisted file means security on) instead of a risky-paths list.
 
 Where the Workflow tool does not exist, apply the same policy by hand.
