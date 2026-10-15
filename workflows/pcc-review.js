@@ -40,6 +40,10 @@ export const meta = {
 const REVIEW_MODEL = 'opus'      // reviewers, verifiers, fix-check: judgment work never on sonnet
 const FIX_MODEL = 'sonnet'
 const LANES_MODEL = 'sonnet'
+// plugin agent types with narrow tool lists: ~12k first turn instead of ~27k for a default subagent
+const REVIEW_AGENT = 'pcc:reviewer'
+const FIX_AGENT = 'pcc:fixer'
+const LANES_AGENT = 'pcc:lanes'
 const SMALL_DELTA_LINES = 100    // changedLines below this -> one reviewer for all lenses
 const MAX_FINDINGS = 8
 const MAX_TRIED = 10
@@ -340,7 +344,19 @@ let note = null
 const addNote = s => { note = note ? note + '; ' + s : s }
 
 // a throwing agent counts as a null attempt, so the retry runs
-const guard = async (prompt, opts) => { try { return await agent(prompt, opts) } catch (e) { return null } }
+const guard = async (prompt, opts) => { try { return await runAgent(prompt, opts) } catch (e) { return null } }
+// types missing (workflow copied without the plugin's agents/): default subagents for this and every later call
+let noAgentTypes = false
+async function runAgent(prompt, opts) {
+  const { agentType, ...plain } = opts
+  if (noAgentTypes) return agent(prompt, plain)
+  try { return await agent(prompt, opts) } catch (e) {
+    if (!agentType || !/agent type '[^']*' not found/.test(String((e && e.message) || e))) throw e
+    if (!noAgentTypes) addNote('pcc agent types not found (workflow copied without the plugin agents?): default subagents used')
+    noAgentTypes = true
+    return agent(prompt, plain)
+  }
+}
 const isObj = x => !!x && typeof x === 'object' && !Array.isArray(x)
 const sameKey = fd => JSON.stringify([fd.severity, fd.file, fd.line, fd.title])
 const words = t => new Set(String(t || '').toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean))
@@ -374,7 +390,7 @@ async function verifyHighs(list, rng, prefix) {
   const survivors = [], refuted = []
   if (!groups.length) return { survivors, refuted }
   const verdicts = await parallel(groups.map((f, i) => () =>
-    agent(verifyPrompt(f, rng, prefix ? `${prefix}-${i + 1}` : i + 1, !!prefix), { label: prefix ? `verify:${prefix}:${i + 1}` : `verify${i + 1}`, phase: 'Verify', model: REVIEW_MODEL, schema: VERDICT_SCHEMA })))
+    runAgent(verifyPrompt(f, rng, prefix ? `${prefix}-${i + 1}` : i + 1, !!prefix), { label: prefix ? `verify:${prefix}:${i + 1}` : `verify${i + 1}`, phase: 'Verify', model: REVIEW_MODEL, agentType: REVIEW_AGENT, schema: VERDICT_SCHEMA })))
   groups.forEach((f, i) => {
     const v = verdicts[i]
     if (v && v.refuted === true) {
@@ -400,7 +416,7 @@ function gitPrompt(pre) {
 // ---------------------------------------------------------------- review (once)
 phase('Review')
 const { mode, groups } = groupsFor(changedLines)
-const ask = (g, label) => guard(reviewPrompt(g, baseRange), { phase: 'Review', model: REVIEW_MODEL, schema: findingsSchema(g), label })
+const ask = (g, label) => guard(reviewPrompt(g, baseRange), { phase: 'Review', model: REVIEW_MODEL, agentType: REVIEW_AGENT, schema: findingsSchema(g), label })
 const reports = await parallel(groups.map(g => async () => {
   const gk = g.join('+')
   const attempts = [await ask(g, `review:${gk}`)]
@@ -469,15 +485,15 @@ while (!status) {
   // the script reads HEAD itself (a read-only git agent) before and after the fixer: git, not the fixer's word, decides
   // cycle 1 probes HEAD; later cycles start from the head the previous post probe returned (no second probe), so a commit that
   // landed in between shows up in the post probe's commit count and blocks
-  const pre = fixCycles === 1 ? await guard(gitPrompt(null), { label: `git:pre:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, schema: GIT_SCHEMA }) : { head }
+  const pre = fixCycles === 1 ? await guard(gitPrompt(null), { label: `git:pre:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, agentType: REVIEW_AGENT, schema: GIT_SCHEMA }) : { head }
   if (!pre || !SHA.test(pre.head)) {
     status = 'blocked'
     addNote('could not read HEAD with git before the fix; no fixer was started')
     log(`${cyc}: ${note}`)
     break
   }
-  const fx = await guard(fixPrompt(items), { label: `fix:${fixCycles}`, phase: 'Fix', model: FIX_MODEL, schema: FIX_SCHEMA })
-  const post = await guard(gitPrompt(pre.head), { label: `git:post:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, schema: POST_GIT_SCHEMA })
+  const fx = await guard(fixPrompt(items), { label: `fix:${fixCycles}`, phase: 'Fix', model: FIX_MODEL, agentType: FIX_AGENT, schema: FIX_SCHEMA })
+  const post = await guard(gitPrompt(pre.head), { label: `git:post:${fixCycles}`, phase: 'Fix', model: GIT_MODEL, agentType: REVIEW_AGENT, schema: POST_GIT_SCHEMA })
   if (!post || !SHA.test(post.head)) {
     status = 'blocked'
     addNote(`could not read HEAD with git after the fix; HEAD may hold an unreviewed commit - inspect or revert HEAD (was ${pre.head})`)
@@ -534,10 +550,10 @@ while (!status) {
   phase('Fix-check')
   const usable = x => !!x && Array.isArray(x.results) && Array.isArray(x.newFindings) && cleanList(x.tried).length > 0 &&
     x.results.every(r => r && Number.isInteger(r.index) && typeof r.fixed === 'boolean')
-  let chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+  let chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}`, phase: 'Fix-check', model: REVIEW_MODEL, agentType: REVIEW_AGENT, schema: CHECK_SCHEMA })
   if (!usable(chk)) {
     log(`${cyc}: fix-check returned nothing or an unusable result, retrying once`)
-    chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}:retry`, phase: 'Fix-check', model: REVIEW_MODEL, schema: CHECK_SCHEMA })
+    chk = await guard(checkPrompt(items, fixBase, fixHead, fixCycles), { label: `fixcheck:${fixCycles}:retry`, phase: 'Fix-check', model: REVIEW_MODEL, agentType: REVIEW_AGENT, schema: CHECK_SCHEMA })
   }
   if (!usable(chk)) {
     uncovered.push('fix-check')
@@ -580,10 +596,11 @@ if (uncovered.length && status !== 'structural') {
 // ---------------------------------------------------------------- lanes
 if (status === 'ship' && doLanes) {
   phase('Lanes')
-  lanes = await agent(lanesPrompt(head), {
+  lanes = await runAgent(lanesPrompt(head), {
     label: 'lanes',
     phase: 'Lanes',
     model: LANES_MODEL,
+    agentType: LANES_AGENT,
     schema: LANES_SCHEMA,
   })
   const laneList = lanes && Array.isArray(lanes.lanes) ? lanes.lanes : []

@@ -20,15 +20,17 @@ function shape(res, schema) {
 
 // The script reads git HEAD through read-only `git:pre:1` / `git:post:N` agents (cycle 1 only probes pre). The harness simulates a repo: HEAD starts at
 // H40('a'); a successful non-structural fixer stub moves it to its reported head. `git(label, sim)` overrides a probe answer.
-function run(args, handler, git) {
+function run(args, handler, git, gate) {
   const calls = []
+  const types = {}
   const prompts = {}
   const logs = []
   const schemas = {}
   const sim = { head: H40('a'), pre: H40('a'), last: null }
   // {raw: X} from a handler is returned to the script unshaped; a handler that throws makes the agent call reject
   const agent = async (prompt, o) => {
-    calls.push(o.label); prompts[o.label] = prompt; schemas[o.label] = o.schema
+    calls.push(o.label); prompts[o.label] = prompt; schemas[o.label] = o.schema; types[o.label] = o.agentType
+    if (gate) gate(o)
     if (o.label.startsWith('git:')) {
       const own = git && git(o.label, sim)
       if (own !== undefined) return own && 'raw' in own && Object.keys(own).length === 1 ? own.raw : own
@@ -42,7 +44,7 @@ function run(args, handler, git) {
   }
   // like the real parallel(): a thunk that throws yields null instead of rejecting
   const parallel = fns => Promise.all(fns.map(f => f().catch(() => null)))
-  return new AsyncFn('args', 'agent', 'parallel', 'phase', 'log', src)(args, agent, parallel, () => {}, m => logs.push(m)).then(r => ({ r, calls, prompts, logs, schemas }))
+  return new AsyncFn('args', 'agent', 'parallel', 'phase', 'log', src)(args, agent, parallel, () => {}, m => logs.push(m)).then(r => ({ r, calls, prompts, logs, schemas, types }))
 }
 const A = { repo: '/x', range: 'a..b' }
 const clean = () => ({ findings: [] })
@@ -621,4 +623,45 @@ test('SPD-1204 git shows two commits -> blocked; git line count over the limit -
   assert.equal(two.r.status, 'blocked')
   const big = await run({ ...A, fix: true }, l => l === 'fix:1' ? FX({ changedLines: 1 }) : mkHigh(l), l => l === 'git:post:1' ? { head: H40('b'), commits: 1, changedLines: 999 } : undefined)
   assert.equal(big.r.status, 'structural') // git's count wins over the fixer's claim
+})
+
+const HIGH_FLOW = l => {
+  if (l === 'fix:1') return FX()
+  if (l === 'fixcheck:1') return chk([ok(1)])
+  if (l === 'lanes') return { verdict: 'green', lanes: [{ name: 'u', result: 'pass', evidence: '' }] }
+  if (l.includes('verify')) return { refuted: false, reason: 'r' }
+  return mkHigh(l)
+}
+const AF = { ...A, fix: true, lanes: true }
+const expectType = l => l === 'fix:1' ? 'pcc:fixer' : l === 'lanes' ? 'pcc:lanes' : 'pcc:reviewer'
+
+test('agent types: every call carries its pcc agentType', async () => {
+  const { r, calls, types } = await run(AF, HIGH_FLOW)
+  assert.equal(r.status, 'ship')
+  for (const want of ['review:security', 'verify', 'git:pre:1', 'fix:1', 'git:post:1', 'fixcheck:1', 'lanes']) assert.ok(calls.some(c => c.startsWith(want)), want)
+  for (const c of calls) assert.equal(types[c], expectType(c), c)
+})
+
+test('agent types: not found -> default subagents, same result, one note, later calls untyped', async () => {
+  const base = await run(AF, HIGH_FLOW)
+  const gate = o => { if (o.agentType) throw new Error("agent({agentType}): agent type 'pcc:reviewer' not found. Available agents: general-purpose") }
+  const { r, calls, types } = await run(AF, HIGH_FLOW, undefined, gate)
+  assert.deepEqual([...new Set(calls)].sort(), base.calls.slice().sort()) // the stub records a rejected typed attempt too
+  assert.equal(r.status, base.r.status)
+  assert.equal(r.head, base.r.head)
+  assert.equal(r.note.split('pcc agent types not found').length - 1, 1)
+  assert.equal(base.r.note, null)
+  assert.ok(Object.values(types).every(t => t === undefined))
+  assert.ok(!calls.some(c => c.includes('retry')))
+  assert.ok(calls.length > base.calls.length)
+})
+
+test('agent types: another error with agentType is not retried', async () => {
+  let n = 0
+  const gate = o => { if (o.label.startsWith('fixcheck:1')) { n++; throw new Error('boom') } }
+  const { r, calls, types } = await run(AF, HIGH_FLOW, undefined, gate)
+  assert.equal(n, 2) // the existing fix-check retry only, no extra untyped attempt
+  assert.equal(calls.filter(c => c.startsWith('fixcheck')).length, 2)
+  assert.equal(types['fixcheck:1:retry'], 'pcc:reviewer')
+  assert.equal(r.note.includes('agent types not found'), false)
 })

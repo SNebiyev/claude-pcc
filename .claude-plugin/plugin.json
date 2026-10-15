@@ -1,7 +1,7 @@
 {
   "name": "pcc",
   "description": "PCC (Pre Commit Check) - a commit-gate protocol for any project: two tiers, step order, speed rules that hold even after a red verdict, a delta-selector baseline keyed to a commit rather than a clock, an external-dependency probe before long suites, evidence rules, and a whole-tree baseline that fans out across parallel subagents",
-  "version": "2.1.0",
+  "version": "2.2.0",
   "author": {
     "name": "Samir Nabiyev"
   },
