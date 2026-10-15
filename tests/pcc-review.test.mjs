@@ -629,7 +629,6 @@ const HIGH_FLOW = l => {
   if (l === 'fix:1') return FX()
   if (l === 'fixcheck:1') return chk([ok(1)])
   if (l === 'lanes') return { verdict: 'green', lanes: [{ name: 'u', result: 'pass', evidence: '' }] }
-  if (l.includes('verify')) return { refuted: false, reason: 'r' }
   return mkHigh(l)
 }
 const AF = { ...A, fix: true, lanes: true }

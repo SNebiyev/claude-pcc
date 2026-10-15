@@ -322,7 +322,7 @@ function checkPrompt(items, base, fixHead, idx) {
 function lanesPrompt(head) {
   return [
     `Run this repo's PCC, tier "sweep", per ${repo}/.claude/pcc.md on ${head ? 'HEAD = ' + head : 'the current HEAD'}. cd to ${repo}.`,
-    `Run every lane the adapter lists for the sweep tier, in the foreground, with the resource limits the adapter names. ${limitsRule} Never pkill/killall; do not touch other dev servers or docker you did not start. ${NO_EXTERNAL}`,
+    `Run every lane the adapter lists for the sweep tier, in the foreground (a lane that may run longer than 10 minutes: Bash run_in_background, then wait on it to completion with Monitor and read its output), with the resource limits the adapter names. ${limitsRule} Never pkill/killall; do not touch other dev servers or docker you did not start. ${NO_EXTERNAL}`,
     'Read the artifacts (reports, logs, junit/json), never trust exit codes alone. Do not commit or push. A lane that could not run is "skipped" with the reason, and a skipped required lane makes the verdict red.',
     'Return verdict green|red and lanes [{name, result pass|fail|skipped, evidence <= 30 words}].',
   ].join('\n')
@@ -345,14 +345,14 @@ const addNote = s => { note = note ? note + '; ' + s : s }
 
 // a throwing agent counts as a null attempt, so the retry runs
 const guard = async (prompt, opts) => { try { return await runAgent(prompt, opts) } catch (e) { return null } }
-// types missing (workflow copied without the plugin's agents/): default subagents for this and every later call
+// types missing (installed pcc plugin older than 2.2.0, or agents/ missing): default subagents for this and every later call, not tool-restricted
 let noAgentTypes = false
 async function runAgent(prompt, opts) {
   const { agentType, ...plain } = opts
   if (noAgentTypes) return agent(prompt, plain)
   try { return await agent(prompt, opts) } catch (e) {
     if (!agentType || !/agent type '[^']*' not found/.test(String((e && e.message) || e))) throw e
-    if (!noAgentTypes) addNote('pcc agent types not found (workflow copied without the plugin agents?): default subagents used')
+    if (!noAgentTypes) addNote('pcc agent types not found (installed pcc plugin older than 2.2.0, or agents/ missing): default subagents used, subagents are not tool-restricted')
     noAgentTypes = true
     return agent(prompt, plain)
   }
